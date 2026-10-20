@@ -1,7 +1,7 @@
 #pragma once
 #include <stdint.h>
 
-#define FB_PHYS	0x9c000000UL
+#define FB_PHYS	0x9d400000UL	/* Mix 2S (Polaris) cont_splash_region */
 
 struct mmu_info {
 	uint64_t img_lo, img_hi, ttbr;
