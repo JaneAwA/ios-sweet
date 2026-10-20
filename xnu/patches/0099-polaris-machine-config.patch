@@ -1,0 +1,104 @@
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index 69b13f9..049a17b 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -29,7 +29,7 @@ SUPPORTED_ARM64_MACHINE_CONFIGS = NONE
+ else ifneq ($(findstring _host,$(RC_ProjectName)),)
+ SUPPORTED_ARM64_MACHINE_CONFIGS = NONE
+ else
+-SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 T6000 T8101 T8103 VMAPPLE SWEET
++SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 T6000 T8101 T8103 VMAPPLE SWEET POLARIS
+ 
+ endif
+ 
+@@ -62,6 +62,7 @@ MACHINE_FLAGS_ARM64_T6000 = -DARM64_BOARD_CONFIG_T6000 		-mcpu=apple-a14
+ MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=armv8.5a
+ MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
+ MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto
++MACHINE_FLAGS_ARM64_POLARIS = -DARM64_BOARD_CONFIG_POLARIS              -march=armv8.2-a+crypto
+ 
+ 
+ #
+@@ -260,8 +261,9 @@ ifeq ($(ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG),)
+ # Without embdedded device map, use a default arch string
+ export ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG := $(shell echo $(CURRENT_ARCH_CONFIG) | tr A-Z a-z)
+ ifneq ($(filter arm64,$(ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG)),)
+-# sweet's Cortex-A76/A55 have no pointer authentication: stay plain arm64
+-ifneq ($(CURRENT_MACHINE_CONFIG),SWEET)
++# sweet's Cortex-A76/A55 and polaris' Kryo 385 have no pointer
++# authentication: stay plain arm64
++ifneq ($(filter SWEET POLARIS,$(CURRENT_MACHINE_CONFIG)),)
+ export ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG := arm64e
+ endif
+ endif
+diff --git a/pexpert/pexpert/arm64/Makefile b/pexpert/pexpert/arm64/Makefile
+index c7d274f..e88a025 100644
+--- a/pexpert/pexpert/arm64/Makefile
++++ b/pexpert/pexpert/arm64/Makefile
+@@ -18,7 +18,8 @@ PRIVATE_KERNELFILES = \
+ 	H13.h \
+ 	VMAPPLE.h \
+ 	BCM2837.h \
+-	SWEET.h
++	SWEET.h \
++	POLARIS.h
+ 
+ 
+ # Headers installed into System.framework/PrivateHeaders (userspace internal SDK only).
+diff --git a/pexpert/pexpert/arm64/POLARIS.h b/pexpert/pexpert/arm64/POLARIS.h
+new file mode 100644
+index 0000000..e0d7730
+--- /dev/null
++++ b/pexpert/pexpert/arm64/POLARIS.h
+@@ -0,0 +1,29 @@
++/*
++ * Board config for the Xiaomi Mi Mix 2S ("polaris", Qualcomm SDM845 /
++ * Snapdragon 845): Kryo 385 = Cortex-A75 + Cortex-A55, ARMv8.2, no PAC.
++ *
++ * SDM845 shares SWEET's (Redmi Note 10 Pro / SM7150) Qualcomm-class plumbing,
++ * so we inherit SWEET.h verbatim rather than duplicating it:
++ *   - GICv3 with two security states (GICD_TYPER SecurityExtn=1): Group 0 is
++ *     TrustZone's, so every interrupt including the timer is a Group 1 IRQ
++ *     taken through sleh_irq().
++ *   - 19.2 MHz architected timer whose virtual timer PPI is INTID 19
++ *     (Qualcomm numbers the timer PPIs 1/2/3/0, so CNTV = 16 + 3 = 19).
++ *   - No pointer authentication -> kernel stays plain arm64 (see MakeInc.def).
++ * Leaving SWEET defined (SWEET.h does that) is deliberate: it keeps the shared
++ * Qualcomm platform code in the sweet patches compiling for this target too.
++ *
++ * What actually differs vs SWEET lives in the device tree (tools/mkadt.py),
++ * not here: framebuffer 0x9d400000/1080x2160 vs 0x9c000000/1080x2400, UFS
++ * aperture 0x2500 vs 0x3000, and 8 homogeneous cores either way.
++ */
++
++#ifndef _PEXPERT_ARM64_POLARIS_H
++#define _PEXPERT_ARM64_POLARIS_H
++
++#include <pexpert/arm64/SWEET.h>
++
++#define POLARIS                        1
++#define SDM845                         1
++
++#endif /* ! _PEXPERT_ARM64_POLARIS_H */
+diff --git a/pexpert/pexpert/arm64/board_config.h b/pexpert/pexpert/arm64/board_config.h
+index 88e524a..a30f752 100644
+--- a/pexpert/pexpert/arm64/board_config.h
++++ b/pexpert/pexpert/arm64/board_config.h
+@@ -108,6 +108,17 @@
+ 
+ #endif  /* ARM64_BOARD_CONFIG_SWEET */
+ 
++#ifdef ARM64_BOARD_CONFIG_POLARIS
++#include <pexpert/arm64/POLARIS.h>
++
++#define MAX_L2_CLINE                   6
++#define MAX_CPUS                       8
++#define MAX_CPU_CLUSTERS               1
++
++#define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
++
++#endif  /* ARM64_BOARD_CONFIG_POLARIS */
++
+ #ifdef ARM64_BOARD_CONFIG_VMAPPLE
+ #include <pexpert/arm64/VMAPPLE.h>
+ 
