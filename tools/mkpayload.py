@@ -195,11 +195,21 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
 
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
-    ap.add_argument('kernel'); ap.add_argument('adt'); ap.add_argument('out')
+    ap.add_argument('kernel', help='xnu kernel Mach-O (from the POLARIS CI build)')
+    ap.add_argument('adt', nargs='?', help='Apple Device Tree blob; defaults to tools/<machine>.adt')
+    ap.add_argument('out', help='payload file the shim boots (embed in shim-boot.img via build.sh $1)')
+    ap.add_argument('--machine', choices=['polaris', 'sweet'], default='polaris',
+                    help='select the bundled ADT (tools/<machine>.adt) when no positional adt is '
+                         'given; POLARIS is the Mi Mix 2S (SDM845) port target (default)')
     ap.add_argument('--cmdline', default='debug=0xc serial=3 cpus=1 keepsyms=1')
     ap.add_argument('--ramdisk', help='root image for md0 (boot with rd=md0)')
     a = ap.parse_args()
-    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk)
+    tools_dir = os.path.dirname(os.path.abspath(__file__))
+    adt_path = a.adt or os.path.join(tools_dir, f'{a.machine}.adt')
+    if not os.path.exists(adt_path):
+        sys.exit(f'ADT not found: {adt_path}\n  pass a positional adt, or run: '
+                 f'python tools/mkadt.py tools/{a.machine}.adt --{a.machine}')
+    blob, info = build(a.kernel, adt_path, a.cmdline, a.ramdisk)
     open(a.out, 'wb').write(blob)
     for k, v in info.items():
         if k != 'segs':
