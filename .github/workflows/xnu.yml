@@ -10,8 +10,8 @@ on:
         description: RELEASE / DEVELOPMENT / DEBUG
         default: DEVELOPMENT
       machine_config:
-        description: xnu MACHINE_CONFIG
-        default: SWEET
+        description: xnu MACHINE_CONFIG (SWEET=732G, POLARIS=SDM845/Mi Mix 2S)
+        default: POLARIS
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
