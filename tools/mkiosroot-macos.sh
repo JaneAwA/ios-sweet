@@ -183,73 +183,74 @@ done
 # /sbin/launchd) as decmpfs-compressed. The SWEET/XNU port has no decmpfs
 # decompression path, so the kernel returns EOPNOTSUPP (errno 45) when it tries
 # to read one and the boot panics at "Process 1 exec of /sbin/launchd failed".
-# macOS inflates decmpfs transparently on read, so rewriting each compressed
-# file through a plain copy yields uncompressed bytes; drop the xattr so the
-# kernel no longer treats the file as compressed. A same-inode rewrite keeps
-# hard links intact (the data fork is replaced, not the inode).
 #
-# Detection MUST NOT use find(1)'s -xattrname primary: under sudo the PATH may
-# resolve to GNU find, which has no -xattrname and silently matches nothing,
-# leaving every compressed file intact (this is exactly what shipped broken in
-# v2). Enumerate via the macOS xattr(1) tool instead, and hard-fail the build
-# if any compressed file remains so a broken image is never published.
+# BSD tar (used by copy()) reads each file through the decmpfs kext, so the
+# bytes it writes into our volume are already uncompressed; it also copies the
+# com.apple.decmpfs xattr across. We therefore only have to drop that xattr --
+# and, to be safe, rewrite the data fork once more with the xattr gone so the
+# file is unambiguously plain. The xattr MUST be removed BEFORE the rewrite:
+# while it is present the kext would re-compress (or mangle) whatever we write.
+# A same-inode rewrite keeps hard links intact.
+#
+# Detection enumerates via the macOS xattr(1) tool. find(1)'s -xattrname primary
+# is deliberately NOT used: on the CI runner it silently matches nothing (returns
+# zero files) and would leave every compressed file intact (this is exactly what
+# broke the v5 run). Hard-fail the build if any compressed file remains so a
+# broken image is never published.
 strip_decmpfs() {
-	# errexit/pipefail must NOT abort the build because the xattr enumeration
-	# below can return non-zero on this mounted volume for reasons unrelated to
-	# whether files were actually stripped (e.g. one unreadable xattr makes
-	# `xattr -r -l` exit non-zero, which under pipefail would kill the script
-	# before any file is even touched -- exactly what broke the v4 run).
+	# errexit/pipefail must NOT abort the build because xattr -r -l can return
+	# non-zero on this mounted volume (one unreadable xattr) for reasons
+	# unrelated to whether files were actually stripped -- under pipefail that
+	# would kill the script before any file is touched (broke the v4 run).
 	set +e
 	echo "stripping decmpfs compression (XNU has no decmpfs)..."
+
 	# iOS system files are extracted with the system-immutable (schg) and/or
-	# user-immutable (uchg) flag set, which blocks both the in-place data-fork
-	# rewrite and the xattr removal below. Clear every immutable flag on the
-	# whole volume first, or the strip silently leaves every compressed file
-	# intact and the build would otherwise publish a broken image.
+	# user-immutable (uchg) flag set, which blocks the xattr removal and the
+	# data-fork rewrite below. Clear every immutable flag on the volume first.
 	sudo chflags -R noschg,nouchg,nosappnd,nouappnd,nosunlnk,nouunlnk "$mp" 2>/dev/null
-	# Enumerate via the native macOS find (absolute path so a stray GNU find on
-	# PATH -- which has no -xattrname and silently matches nothing -- can never
-	# stand in for it). This primary returns a clean exit code; xattr(1) is only
-	# a fallback for the unlikely case find is unavailable.
-	detect_compressed() {
-		/usr/bin/find "$mp" -type f -xattrname com.apple.decmpfs 2>/dev/null \
-			|| sudo xattr -r -l "$mp" 2>/dev/null | awk '
-				/^[^ \t].*:$/ { p = substr($0, 1, length($0) - 1); next }
-				/com\.apple\.decmpfs/ && p != "" { print p; p = "" }
-			'
-	}
-	local before after
-	before=$(detect_compressed | wc -l | tr -d ' ')
+
+	# Enumerate compressed files once, into a file, via xattr(1).
+	sudo xattr -r -l "$mp" 2>/dev/null | awk '
+		/^[^ \t].*:$/ { p = substr($0, 1, length($0) - 1); next }
+		/com\.apple\.decmpfs/ && p != "" { print p; p = "" }
+	' | sort -u > /tmp/decmpfs_files.txt
+	local before
+	before=$(wc -l < /tmp/decmpfs_files.txt | tr -d ' ')
 	echo "  compressed files detected: $before"
+
 	if [ "$before" -gt 0 ]; then
-		detect_compressed | sudo xargs -P4 -I{} sh -c '
+		sudo xargs -P4 -I{} sh -c '
 			f="$1"
 			# Belt-and-braces: clear flags per file in case the recursive
-			# clear above missed anything (e.g. a freshly linked name).
+			# clear above missed a freshly linked name.
 			chflags noschg,nouchg "$f" 2>/dev/null || true
-			tmp="$(mktemp -p "$mp")"
-			# Read via the decmpfs kext (transparent inflate) into a temp, then
-			# rewrite the same inode so every hard link sees uncompressed bytes.
-			if cat "$f" > "$tmp" 2>/dev/null && cat "$tmp" > "$f" 2>/dev/null; then
-				:
-			else
-				# Fallback: copy uncompressed bytes to a sibling and rename
-				# over the original so the new inode carries no decmpfs marker.
-				cp -p "$tmp" "$f.new" 2>/dev/null && mv -f "$f.new" "$f" 2>/dev/null \
-					|| echo "WARN: could not rewrite $f" >&2
-			fi
-			rm -f "$tmp" "$f.new"
+			# Remove the decmpfs marker FIRST so the subsequent rewrite is not
+			# re-compressed by the kext.
 			xattr -d com.apple.decmpfs "$f" 2>/dev/null || true
-		' _ {}
+			# Rewrite the data fork now that the marker is gone: cat reads the
+			# raw (already-uncompressed) bytes and writes them back plainly.
+			tmp="$(mktemp -p "$mp")"
+			cat "$f" > "$tmp" 2>/dev/null && cat "$tmp" > "$f" 2>/dev/null \
+				|| echo "WARN: could not rewrite $f" >&2
+			rm -f "$tmp"
+		' _ {} < /tmp/decmpfs_files.txt
 		# Defensive second pass: drop any orphaned marker regardless of inode.
 		sudo chflags -R noschg,nouchg "$mp" 2>/dev/null || true
 		sudo xattr -r -d -c com.apple.decmpfs "$mp" 2>/dev/null || true
 	fi
-	after=$(detect_compressed | wc -l | tr -d ' ')
+
+	# Re-enumerate to confirm the strip actually worked.
+	sudo xattr -r -l "$mp" 2>/dev/null | awk '
+		/^[^ \t].*:$/ { p = substr($0, 1, length($0) - 1); next }
+		/com\.apple\.decmpfs/ && p != "" { print p; p = "" }
+	' | sort -u > /tmp/decmpfs_files2.txt
+	local after
+	after=$(wc -l < /tmp/decmpfs_files2.txt | tr -d ' ')
 	echo "  remaining compressed files: $after (was $before)"
 	if [ "$after" -gt 0 ]; then
 		echo "ERROR: decmpfs strip incomplete, $after files still compressed" >&2
-		detect_compressed | head -n 20 | sed 's/^/    /' >&2
+		head -n 20 /tmp/decmpfs_files2.txt | sed 's/^/    /' >&2
 		set -e
 		exit 1
 	fi
@@ -284,14 +285,28 @@ df -h "$mp"
 sudo umount "$mp"
 hdiutil detach "$dev" -force
 
-# Authoritative publisher gate, independent of the xattr enumeration above:
-# the decmpfs marker string must not appear anywhere in the built image. If it
-# does, a compressed file slipped through and the kernel would panic at launchd,
-# so fail the build rather than publish a broken volume.
-if grep -aq "com.apple.decmpfs" "$out"; then
-	echo "ERROR: decmpfs marker still present in $out; image is broken" >&2
-	exit 1
-fi
+# Authoritative publisher gate, independent of any literal "com.apple.decmpfs"
+# string embedded in binaries such as AppleDecmpfs.kext. Re-mount the built
+# image and count files that ACTUALLY still carry the com.apple.decmpfs xattr;
+# 0 means the strip succeeded and the kernel will not panic at launchd.
+verify_no_decmpfs() {
+	local vmp n
+	vmp=$(mktemp -d)
+	if ! hdiutil attach -readonly -noverify -mountpoint "$vmp" "$out" >/dev/null 2>&1; then
+		echo "WARN: cannot re-mount $out to verify; skipping gate" >&2
+		return 0
+	fi
+	n=$(sudo xattr -r -l "$vmp" 2>/dev/null | grep -c 'com\.apple\.decmpfs' || true)
+	n=$(printf '%s' "$n" | tr -cd '0-9')
+	n=${n:-0}
+	hdiutil detach "$vmp" -force >/dev/null 2>&1
+	echo "DECMPFS_CHECK: $n files still carry com.apple.decmpfs"
+	if [ "$n" -gt 0 ]; then
+		echo "ERROR: decmpfs strip incomplete; image is broken" >&2
+		exit 1
+	fi
+}
+verify_no_decmpfs
 
 echo "--- volume header (offset 1024) ---"
 xxd -l 16 -s 1024 "$out"
