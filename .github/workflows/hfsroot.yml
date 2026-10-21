@@ -91,6 +91,10 @@ jobs:
         run: |
           set -euo pipefail
           IFS=',' read -r osname sysname appname <<< "${{ inputs.dmg_names }}"
+          # Belt-and-suspenders: strip any stray CR so the shebang is never
+          # "/bin/bash^M" (CRLF endings silently break the interpreter lookup).
+          tr -d '\r' < tools/mkiosroot-macos.sh > tools/mkiosroot-macos.sh.tmp \
+            && mv -f tools/mkiosroot-macos.sh.tmp tools/mkiosroot-macos.sh
           chmod +x tools/mkiosroot-macos.sh
           ./tools/mkiosroot-macos.sh "$PWD/ios16-root.raw" \
             "dmg/$osname.dmg" "dmg/$sysname.dmg" "dmg/$appname.dmg" \
