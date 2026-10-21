@@ -177,6 +177,31 @@ for c in OS App; do
 		done
 done
 
+# Strip HFS+ decmpfs compression from every file on the volume.
+#
+# iOS 16 root images store a large fraction of their files (including
+# /sbin/launchd) as decmpfs-compressed. The SWEET/XNU port has no decmpfs
+# decompression path, so the kernel returns EOPNOTSUPP (errno 45) when it tries
+# to read one and the boot panics at "Process 1 exec of /sbin/launchd failed".
+# macOS inflates decmpfs transparently on read, so rewriting each compressed
+# file through a plain copy yields uncompressed bytes; drop the xattr so the
+# kernel no longer treats the file as compressed. A same-inode rewrite keeps
+# hard links intact (the data fork is replaced, not the inode).
+strip_decmpfs() {
+	echo "stripping decmpfs compression (XNU has no decmpfs)..."
+	local n=0
+	sudo find "$mp" -type f -xattrname com.apple.decmpfs 2>/dev/null | sudo xargs -I{} sh -c '
+		tmp=$(mktemp)
+		cat "$1" > "$tmp"
+		cat "$tmp" > "$1"
+		rm -f "$tmp"
+		xattr -d com.apple.decmpfs "$1" 2>/dev/null || true
+	' _ {}
+	n=$(sudo find "$mp" -type f -xattrname com.apple.decmpfs 2>/dev/null | wc -l | tr -d " ")
+	echo "decmpfs strip done; remaining compressed files: $n"
+}
+strip_decmpfs
+
 # logd's log stores, normally made at restore: it checks owner _logd (272) and
 # mode, plus a .migrated marker, else it asks a helper and crashes
 # ("BUG IN LIBTRACE: Failed to migrate directory").
