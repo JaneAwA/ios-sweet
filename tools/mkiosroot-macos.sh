@@ -187,18 +187,47 @@ done
 # file through a plain copy yields uncompressed bytes; drop the xattr so the
 # kernel no longer treats the file as compressed. A same-inode rewrite keeps
 # hard links intact (the data fork is replaced, not the inode).
+#
+# Detection MUST NOT use find(1)'s -xattrname primary: under sudo the PATH may
+# resolve to GNU find, which has no -xattrname and silently matches nothing,
+# leaving every compressed file intact (this is exactly what shipped broken in
+# v2). Enumerate via the macOS xattr(1) tool instead, and hard-fail the build
+# if any compressed file remains so a broken image is never published.
 strip_decmpfs() {
 	echo "stripping decmpfs compression (XNU has no decmpfs)..."
-	local n=0
-	sudo find "$mp" -type f -xattrname com.apple.decmpfs 2>/dev/null | sudo xargs -I{} sh -c '
-		tmp=$(mktemp)
-		cat "$1" > "$tmp"
-		cat "$tmp" > "$1"
-		rm -f "$tmp"
-		xattr -d com.apple.decmpfs "$1" 2>/dev/null || true
-	' _ {}
-	n=$(sudo find "$mp" -type f -xattrname com.apple.decmpfs 2>/dev/null | wc -l | tr -d " ")
-	echo "decmpfs strip done; remaining compressed files: $n"
+	detect_compressed() {
+		if command -v xattr >/dev/null 2>&1; then
+			sudo xattr -r -l "$mp" 2>/dev/null | awk '
+				/^[^ \t].*:$/ { p = substr($0, 1, length($0) - 1); next }
+				/com\.apple\.decmpfs/ && p != "" { print p; p = "" }
+			'
+		else
+			sudo /usr/bin/find "$mp" -type f -xattrname com.apple.decmpfs 2>/dev/null
+		fi
+	}
+	local before after
+	before=$(detect_compressed | wc -l | tr -d ' ')
+	echo "  compressed files detected: $before"
+	if [ "$before" -gt 0 ]; then
+		detect_compressed | sudo xargs -I{} sh -c '
+			f="$1"
+			tmp="$(mktemp -p "$mp")"
+			# Read via the decmpfs kext (transparent inflate) into a temp, then
+			# rewrite the same inode so every hard link sees uncompressed bytes.
+			cat "$f" > "$tmp" 2>/dev/null && cat "$tmp" > "$f" 2>/dev/null
+			rm -f "$tmp"
+			xattr -d com.apple.decmpfs "$f" 2>/dev/null || true
+		' _ {}
+		# Defensive second pass: drop any orphaned marker regardless of inode.
+		sudo xattr -r -d -c com.apple.decmpfs "$mp" 2>/dev/null || true
+	fi
+	after=$(detect_compressed | wc -l | tr -d ' ')
+	echo "  remaining compressed files: $after (was $before)"
+	if [ "$after" -gt 0 ]; then
+		echo "ERROR: decmpfs strip incomplete, $after files still compressed" >&2
+		exit 1
+	fi
+	echo "decmpfs strip complete"
 }
 strip_decmpfs
 
