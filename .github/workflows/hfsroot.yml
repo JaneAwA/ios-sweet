@@ -1,0 +1,59 @@
+name: hfsroot
+
+# Builds the HFS+ volume that XNU mounts as its BSD root from the internal UFS.
+# XNU will only accept an HFS+ volume, and the only HFS+ writer we have access
+# to is macOS's newfs_hfs, so this runs on a macos-14 runner even though the
+# kernel itself is built there too.
+
+on:
+  workflow_dispatch:
+    inputs:
+      size_mb:
+        description: HFS+ volume size in MB
+        default: "32"
+      journal:
+        description: journaled (1) or plain (0)
+        default: "1"
+      with_init:
+        description: install the bring-up init as /sbin/launchd
+        default: "true"
+
+concurrency:
+  group: hfsroot-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hfsroot:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: decode the bring-up init
+        if: ${{ inputs.with_init == 'true' }}
+        run: |
+          base64 --decode -o "$RUNNER_TEMP/sweet-init" tools/sweet-init.b64
+          ls -l "$RUNNER_TEMP/sweet-init"
+          file "$RUNNER_TEMP/sweet-init"
+
+      - name: build the HFS+ image
+        env:
+          JOURNAL: ${{ inputs.journal }}
+          LABEL: SweetRoot
+        run: |
+          init=""
+          if [[ "${{ inputs.with_init }}" == "true" ]]; then
+            init="$RUNNER_TEMP/sweet-init"
+          fi
+          chmod +x tools/mkhfsroot.sh
+          ./tools/mkhfsroot.sh "$PWD/root-hfs.raw" "${{ inputs.size_mb }}" "$init"
+
+      - name: fingerprint
+        run: |
+          shasum -a 256 root-hfs.raw | tee SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hfs-root
+          path: |
+            root-hfs.raw
+            SHA256SUMS
