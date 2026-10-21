@@ -116,7 +116,12 @@ echo "mounted $mounted at $mp"
 copy() {
 	echo "copying $1 -> ${2#$mp}"
 	sudo mkdir -p "$2"
-	sudo rsync -aH --numeric-ids "$1/" "$2/"
+	# Not rsync: the one that ships with macOS is 2.6.9 built with a 32 bit
+	# off_t, and the shared cache files here are past 2 GB, so it dies with
+	# "Result too large (34)" partway through the system cryptex. bsdtar is
+	# 64 bit and carries the same set of attributes rsync was carrying for us
+	# (owner, mode, symlinks, hard links, xattrs).
+	(sudo tar -cf - -C "$1" .) | (sudo tar -xpf - -C "$2")
 }
 copy "$osroot" "$mp"
 copy "$sysroot" "$mp/private/preboot/Cryptexes/OS"
