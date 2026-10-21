@@ -66,7 +66,8 @@ attach_ro "$appimg" "$work/appos"
 # than hard-coding one, and say which one we saw.
 pick_root() {
 	local mp=$1
-	echo "  $(basename "$mp") top level: $(ls -1 "$mp" | head -6 | tr '\n' ' ')"
+	# The diagnostic goes to stderr: this function's stdout is its result.
+	echo "  $(basename "$mp") top level: $(ls -1 "$mp" | head -6 | tr '\n' ' ')" >&2
 	if [[ -d $mp/root ]]; then
 		printf '%s' "$mp/root"
 	else
