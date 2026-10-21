@@ -60,7 +60,22 @@ attach_ro "$osimg" "$work/os"
 attach_ro "$sysimg" "$work/sysos"
 attach_ro "$appimg" "$work/appos"
 
-sources=("$work/os/root" "$work/sysos/root")
+# apfs-fuse exposes each volume as a directory under the mount point, so the
+# upstream recipe copies out of <mount>/root. macOS mounts the volume itself,
+# so its top level is already the filesystem root. Accept either shape rather
+# than hard-coding one, and say which one we saw.
+pick_root() {
+	local mp=$1
+	echo "  $(basename "$mp") top level: $(ls -1 "$mp" | head -6 | tr '\n' ' ')"
+	if [[ -d $mp/root ]]; then
+		printf '%s' "$mp/root"
+	else
+		printf '%s' "$mp"
+	fi
+}
+osroot=$(pick_root "$work/os")
+sysroot=$(pick_root "$work/sysos")
+sources=("$osroot" "$sysroot")
 for s in "${sources[@]}"; do
 	[[ -d $s ]] || { echo "no root/ inside $s" >&2; exit 1; }
 done
@@ -102,10 +117,12 @@ copy() {
 	sudo mkdir -p "$2"
 	sudo rsync -aH --numeric-ids "$1/" "$2/"
 }
-copy "$work/os/root" "$mp"
-copy "$work/sysos/root" "$mp/private/preboot/Cryptexes/OS"
+copy "$osroot" "$mp"
+copy "$sysroot" "$mp/private/preboot/Cryptexes/OS"
 if [[ -d $work/appos/root ]]; then
 	copy "$work/appos/root" "$mp/private/preboot/Cryptexes/App"
+else
+	copy "$work/appos" "$mp/private/preboot/Cryptexes/App"
 fi
 
 # The files in these images are LZBITMAP-compressed. If the APFS reader handed
