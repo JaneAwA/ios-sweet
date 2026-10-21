@@ -34,12 +34,24 @@ echo "  device $dev"
 
 jflag=""
 [[ $journal == 1 ]] && jflag="-J"
-# newfs_hfs on the whole disk: the image intentionally carries no partition map.
+# newfs_hfs on the whole disk: the image intentionally carries no partition
+# map, so the volume header belongs at block 0.
 sudo newfs_hfs $jflag -v "$label" "$dev"
 
 mp=$(mktemp -d)
 trap 'sudo umount "$mp" 2>/dev/null || true; hdiutil detach "$dev" 2>/dev/null || true; rmdir "$mp" 2>/dev/null || true' EXIT
-sudo mount_hfs "$dev" "$mp"
+
+# Attaching a partition-map-less image usually gives only the whole-disk node,
+# but macOS sometimes synthesises a slice: mount whichever one exists.
+mounted=""
+for cand in "$dev" "${dev}s1"; do
+	if [[ -b $cand ]] && sudo mount_hfs "$cand" "$mp" 2>/dev/null; then
+		mounted=$cand
+		break
+	fi
+done
+[[ -z $mounted ]] && { echo "could not mount $dev" >&2; exit 1; }
+echo "  mounted $mounted"
 
 if [[ -n $init ]]; then
 	echo "installing /sbin/launchd"

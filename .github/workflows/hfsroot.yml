@@ -31,7 +31,8 @@ jobs:
       - name: decode the bring-up init
         if: ${{ inputs.with_init == 'true' }}
         run: |
-          base64 --decode -o "$RUNNER_TEMP/sweet-init" tools/sweet-init.b64
+          # BSD base64: -D to decode, and it wants -i/-o or redirection.
+          base64 -D < tools/sweet-init.b64 > "$RUNNER_TEMP/sweet-init"
           ls -l "$RUNNER_TEMP/sweet-init"
           file "$RUNNER_TEMP/sweet-init"
 
