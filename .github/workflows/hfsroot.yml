@@ -94,7 +94,7 @@ jobs:
           chmod +x tools/mkiosroot-macos.sh
           ./tools/mkiosroot-macos.sh "$PWD/ios16-root.raw" \
             "dmg/$osname.dmg" "dmg/$sysname.dmg" "dmg/$appname.dmg" \
-            "${{ inputs.headroom_kb }}"
+            "${{ inputs.headroom_kb }}" 2>&1 | tee mkiosroot.log
 
       - name: make it sparse
         if: ${{ inputs.mode == 'ios' && inputs.sparse == 'true' }}
@@ -108,6 +108,12 @@ jobs:
       - name: fingerprint
         run: |
           shasum -a 256 *.raw *.simg 2>/dev/null | tee SHA256SUMS || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-log
+          path: mkiosroot.log
 
       - uses: actions/upload-artifact@v4
         with:
