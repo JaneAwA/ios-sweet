@@ -188,12 +188,16 @@ for d in diagnostics uuidtext diagnostics/timesync; do
 	sudo install -o 272 -g 272 -m 0644 /dev/null "$db/$d/.migrated"
 done
 
-# System keybag for the built-in AppleKeyStore (no passcode).
-sudo install -d -m 0700 -o 0 -g 0 "$mp/private/var/keybags"
+# System keybag for the built-in AppleKeyStore (no passcode). Written to a
+# real file first: BSD install refuses /dev/stdin as a source ("Inappropriate
+# file type or format", exit 71), which is how the previous run ended after
+# four and a half minutes of good work.
+kb=$work/systembag.kb
 printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
 	'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
-	'<plist version="1.0"><dict><key>KeyBagKeys</key><data>U1dFRVQ=</data></dict></plist>' |
-	sudo install -m 0600 -o 0 -g 0 /dev/stdin "$mp/private/var/keybags/systembag.kb"
+	'<plist version="1.0"><dict><key>KeyBagKeys</key><data>U1dFRVQ=</data></dict></plist>' > "$kb"
+sudo install -d -m 0700 -o 0 -g 0 "$mp/private/var/keybags"
+sudo install -m 0600 -o 0 -g 0 "$kb" "$mp/private/var/keybags/systembag.kb"
 
 df -h "$mp"
 sudo umount "$mp"
