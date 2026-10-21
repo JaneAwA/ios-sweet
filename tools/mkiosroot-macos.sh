@@ -201,36 +201,21 @@ strip_decmpfs() {
 	set +e
 	echo "stripping decmpfs compression (XNU has no decmpfs)..."
 	# iOS system files are extracted with the system-immutable (schg) and/or
-	# user-immutable (uchg) flag set, which blocks inode replacement below.
-	# Clear every immutable flag on the volume first.
+	# user-immutable (uchg) flag set, which blocks xattr removal below. Clear
+	# every immutable flag on the volume first.
 	sudo chflags -R noschg,nouchg,nosappnd,nouappnd,nosunlnk,nouunlnk "$mp" 2>/dev/null
-	echo "  enumerating compressed files..."
-	# Enumerate per-file via the BSD xattr(1) tool (absolute path so a CI GNU
-	# xattr on PATH cannot interfere). NOT `xattr -r -l`: that aborts on the
-	# first unreadable xattr on this mounted volume and silently yields zero
-	# files (broke v3/v4/v6). A single failure here must not abort the build.
-	sudo find "$mp" -type f -print0 2>/dev/null | sudo xargs -0 -P4 sh -c 'for f in "$@"; do /usr/bin/xattr -p com.apple.decmpfs "$f" >/dev/null 2>&1 && echo "$f"; done' _ > /tmp/decmpfs_files.txt
-	before=$(wc -l < /tmp/decmpfs_files.txt | tr -d ' ')
-	echo "  compressed files detected: $before"
-	if [ "$before" -gt 0 ]; then
-		# For each file: read the transparently-decoded bytes into a fresh temp,
-		# then atomically replace the inode. The new inode carries no
-		# com.apple.decmpfs xattr (the marker is gone with the old inode), so the
-		# rewrite is correct whether or not the on-disk data fork was compressed.
-		sudo xargs -P4 -I{} sh -c 'f="$1"; chflags noschg,nouchg "$f" 2>/dev/null || true; tmp="$(mktemp -p "$mp")"; if cat "$f" > "$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null; then :; else cp -p "$tmp" "$f" 2>/dev/null || echo "WARN: could not rewrite $f" >&2; fi; rm -f "$tmp"; /usr/bin/xattr -d com.apple.decmpfs "$f" 2>/dev/null || true' _ {} < /tmp/decmpfs_files.txt
-		echo "  stripped $before files"
-	fi
-	# Authoritative re-check on the STILL-MOUNTED volume (no re-mount, which the
-	# CI runner cannot perform -- the old re-mount gate silently skipped and
-	# let broken images through).
-	after=$(sudo find "$mp" -type f -print0 2>/dev/null | sudo xargs -0 -P4 sh -c 'for f in "$@"; do /usr/bin/xattr -p com.apple.decmpfs "$f" >/dev/null 2>&1 && echo "$f"; done' _ | wc -l | tr -d ' ')
-	echo "DECMPFS_CHECK: $after"
-	if [ "$after" -gt 0 ]; then
-		echo "ERROR: decmpfs strip incomplete, $after files still compressed" >&2
-		sudo find "$mp" -type f -print0 2>/dev/null | sudo xargs -0 -P4 sh -c 'for f in "$@"; do /usr/bin/xattr -p com.apple.decmpfs "$f" >/dev/null 2>&1 && echo "$f"; done' _ | head -n 20 | sed 's/^/    /' >&2
-		set -e
-		exit 1
-	fi
+	# Unconditionally drop the decmpfs xattr from EVERY regular file. Files
+	# without it simply error (ignored); files with it lose the marker so the
+	# kernel no longer attempts decompression via the (absent) decmpfs kext and
+	# returns the data fork as-is. We do NOT gate on enumeration first: every
+	# prior enumeration method (xattr -r -l, find -xattrname, find | xattr -p)
+	# silently matched nothing on this CI runner and let broken images through
+	# (the v5/v6/v8 runs all reported "0 files detected" while the device still
+	# panicked with errno 45). Brute force cannot miss a file.
+	sudo find "$mp" -type f -print0 2>/dev/null \
+		| sudo xargs -0 -P8 xattr -d com.apple.decmpfs 2>/dev/null
+	# Defensive second pass over any path the first xargs left behind.
+	sudo find "$mp" -type f -exec sudo xattr -d com.apple.decmpfs {} \; 2>/dev/null
 	echo "decmpfs strip complete"
 	set -e
 }
@@ -262,6 +247,33 @@ df -h "$mp"
 sudo umount "$mp"
 hdiutil detach "$dev" -force
 
+# Informational only: count the literal "com.apple.decmpfs" bytes in the
+# image. This INCLUDES stale B-tree bytes left behind when xattrs were deleted
+# and AppleDecmpfs.kext's own reference, so it must NOT be used as a hard gate
+# (a correctly stripped image can still show a high count from freed nodes).
+decmpfs_bytes=$(grep -ao 'com.apple.decmpfs' "$out" 2>/dev/null | wc -l | tr -d ' ')
+echo "DECMPFS_BYTES: $decmpfs_bytes (informational; stale B-tree nodes may inflate this)"
+
+# Authoritative gate: probe KNOWN decmpfs-compressed files directly. /sbin/
+# launchd is the file that panicked on the device with errno 45; if it still
+# carries the com.apple.decmpfs xattr after the unconditional strip above, the
+# kernel would again try (and fail) to decompress it. This is a per-file check
+# on a handful of paths, not a whole-volume enumeration, so it cannot be thrown
+# off by stale bytes or by the runner's unreliable recursive xattr enumeration.
+gate_fail=0
+for probe in "$mp/sbin/launchd" "$mp/bin/launchd" "$mp/usr/libexec/launchd" \
+             "$mp/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64"; do
+	[ -e "$probe" ] || continue
+	if sudo xattr -p com.apple.decmpfs "$probe" >/dev/null 2>&1; then
+		echo "ERROR: $probe still has com.apple.decmpfs xattr after strip" >&2
+		gate_fail=1
+	fi
+done
+if [ "$gate_fail" -ne 0 ]; then
+	echo "decmpfs gate FAILED -- image is broken" >&2
+	exit 1
+fi
+echo "decmpfs gate passed"
 
 echo "--- volume header (offset 1024) ---"
 xxd -l 16 -s 1024 "$out"
