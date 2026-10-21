@@ -8,14 +8,29 @@ name: hfsroot
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "init = small bring-up volume, ios = full iOS 16 root"
+        default: "init"
       size_mb:
-        description: HFS+ volume size in MB
+        description: HFS+ volume size in MB (init mode)
         default: "32"
       journal:
-        description: journaled (1) or plain (0)
+        description: journaled (1) or plain (0) (init mode)
         default: "1"
       with_init:
-        description: install the bring-up init as /sbin/launchd
+        description: install the bring-up init as /sbin/launchd (init mode)
+        default: "true"
+      ipsw_url:
+        description: "HTTPS URL of the IPSW to take the images from (ios mode)"
+        default: ""
+      dmg_names:
+        description: "OS,SystemOS,AppOS image basenames inside the IPSW (ios mode)"
+        default: "087-86698-044,087-86593-047,087-86715-047"
+      headroom_kb:
+        description: free space to leave on the built volume (ios mode)
+        default: "1048576"
+      sparse:
+        description: also emit a sparse image for fastboot (ios mode)
         default: "true"
 
 concurrency:
@@ -31,11 +46,9 @@ jobs:
       - name: runner disk
         run: |
           df -h / /System/Volumes/Data 2>/dev/null | head -6
-          echo "--- xcode/command line tools ---"
-          xcode-select -p
 
       - name: decode the bring-up init
-        if: ${{ inputs.with_init == 'true' }}
+        if: ${{ inputs.mode != 'ios' && inputs.with_init == 'true' }}
         run: |
           # BSD base64: -D to decode, and it wants -i/-o or redirection.
           base64 -D < tools/sweet-init.b64 > "$RUNNER_TEMP/sweet-init"
@@ -43,6 +56,7 @@ jobs:
           file "$RUNNER_TEMP/sweet-init"
 
       - name: build the HFS+ image
+        if: ${{ inputs.mode != 'ios' }}
         env:
           JOURNAL: ${{ inputs.journal }}
           LABEL: SweetRoot
@@ -54,13 +68,51 @@ jobs:
           chmod +x tools/mkhfsroot.sh
           ./tools/mkhfsroot.sh "$PWD/root-hfs.raw" "${{ inputs.size_mb }}" "$init"
 
+      - name: fetch the IPSW images
+        if: ${{ inputs.mode == 'ios' }}
+        run: |
+          set -euo pipefail
+          mkdir -p dmg
+          curl -L --retry 3 --retry-delay 5 -o ipsw.zip "${{ inputs.ipsw_url }}"
+          ls -l ipsw.zip
+          IFS=',' read -r osname sysname appname <<< "${{ inputs.dmg_names }}"
+          # One at a time: the IPSW is 6 GB and the images inside it another
+          # 7.5 GB, and the target volume has to share the disk with them.
+          for n in "$osname" "$sysname" "$appname"; do
+            unzip -o -j ipsw.zip "$n.dmg" -d dmg
+          done
+          rm -f ipsw.zip
+          ls -l dmg
+
+      - name: build the iOS root image
+        if: ${{ inputs.mode == 'ios' }}
+        env:
+          LABEL: iOSRoot
+        run: |
+          set -euo pipefail
+          IFS=',' read -r osname sysname appname <<< "${{ inputs.dmg_names }}"
+          chmod +x tools/mkiosroot-macos.sh
+          ./tools/mkiosroot-macos.sh "$PWD/ios16-root.raw" \
+            "dmg/$osname.dmg" "dmg/$sysname.dmg" "dmg/$appname.dmg" \
+            "${{ inputs.headroom_kb }}"
+
+      - name: make it sparse
+        if: ${{ inputs.mode == 'ios' && inputs.sparse == 'true' }}
+        run: |
+          python3 tools/img2simg.py ios16-root.raw ios16-root.simg
+          # The raw image is ten GB of mostly nothing; only the sparse one is
+          # worth downloading.
+          rm -f ios16-root.raw
+          ls -l ios16-root.simg
+
       - name: fingerprint
         run: |
-          shasum -a 256 root-hfs.raw | tee SHA256SUMS
+          shasum -a 256 *.raw *.simg 2>/dev/null | tee SHA256SUMS || true
 
       - uses: actions/upload-artifact@v4
         with:
           name: hfs-root
           path: |
-            root-hfs.raw
+            *.raw
+            *.simg
             SHA256SUMS
