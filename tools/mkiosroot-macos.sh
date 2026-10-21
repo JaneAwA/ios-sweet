@@ -251,7 +251,7 @@ hdiutil detach "$dev" -force
 # image. This INCLUDES stale B-tree bytes left behind when xattrs were deleted
 # and AppleDecmpfs.kext's own reference, so it must NOT be used as a hard gate
 # (a correctly stripped image can still show a high count from freed nodes).
-decmpfs_bytes=$(grep -ao 'com.apple.decmpfs' "$out" 2>/dev/null | wc -l | tr -d ' ')
+decmpfs_bytes=$(grep -ao 'com.apple.decmpfs' "$out" 2>/dev/null | wc -l | tr -d ' ') || true
 echo "DECMPFS_BYTES: $decmpfs_bytes (informational; stale B-tree nodes may inflate this)"
 
 # Authoritative gate: probe KNOWN decmpfs-compressed files directly. /sbin/
