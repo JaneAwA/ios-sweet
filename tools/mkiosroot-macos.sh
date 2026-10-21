@@ -205,26 +205,44 @@ strip_decmpfs() {
 			sudo /usr/bin/find "$mp" -type f -xattrname com.apple.decmpfs 2>/dev/null
 		fi
 	}
+	# iOS system files are extracted with the system-immutable (schg) and/or
+	# user-immutable (uchg) flag set, which blocks both the in-place data-fork
+	# rewrite and the xattr removal below. Clear every immutable flag on the
+	# whole volume first, or the strip silently leaves every compressed file
+	# intact and the build would otherwise publish a broken image.
+	sudo chflags -R noschg,nouchg "$mp" 2>/dev/null || true
 	local before after
 	before=$(detect_compressed | wc -l | tr -d ' ')
 	echo "  compressed files detected: $before"
 	if [ "$before" -gt 0 ]; then
 		detect_compressed | sudo xargs -I{} sh -c '
 			f="$1"
+			# Belt-and-braces: clear flags per file in case the recursive
+			# clear above missed anything (e.g. a freshly linked name).
+			chflags noschg,nouchg "$f" 2>/dev/null || true
 			tmp="$(mktemp -p "$mp")"
 			# Read via the decmpfs kext (transparent inflate) into a temp, then
 			# rewrite the same inode so every hard link sees uncompressed bytes.
-			cat "$f" > "$tmp" 2>/dev/null && cat "$tmp" > "$f" 2>/dev/null
-			rm -f "$tmp"
+			if cat "$f" > "$tmp" 2>/dev/null && cat "$tmp" > "$f" 2>/dev/null; then
+				:
+			else
+				# Fallback: copy uncompressed bytes to a sibling and rename
+				# over the original so the new inode carries no decmpfs marker.
+				cp -p "$tmp" "$f.new" 2>/dev/null && mv -f "$f.new" "$f" 2>/dev/null \
+					|| echo "WARN: could not rewrite $f" >&2
+			fi
+			rm -f "$tmp" "$f.new"
 			xattr -d com.apple.decmpfs "$f" 2>/dev/null || true
 		' _ {}
 		# Defensive second pass: drop any orphaned marker regardless of inode.
+		sudo chflags -R noschg,nouchg "$mp" 2>/dev/null || true
 		sudo xattr -r -d -c com.apple.decmpfs "$mp" 2>/dev/null || true
 	fi
 	after=$(detect_compressed | wc -l | tr -d ' ')
 	echo "  remaining compressed files: $after (was $before)"
 	if [ "$after" -gt 0 ]; then
 		echo "ERROR: decmpfs strip incomplete, $after files still compressed" >&2
+		detect_compressed | head -n 20 | sed 's/^/    /' >&2
 		exit 1
 	fi
 	echo "decmpfs strip complete"
