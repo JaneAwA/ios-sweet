@@ -28,6 +28,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: runner disk
+        run: |
+          df -h / /System/Volumes/Data 2>/dev/null | head -6
+          echo "--- xcode/command line tools ---"
+          xcode-select -p
+
       - name: decode the bring-up init
         if: ${{ inputs.with_init == 'true' }}
         run: |
