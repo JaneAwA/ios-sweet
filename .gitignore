@@ -8,3 +8,6 @@ shim/out/
 xnu/out/
 xnu/out-*/
 __pycache__/
+
+# generated device trees (built locally by tools/mkadt.py)
+*.adt
