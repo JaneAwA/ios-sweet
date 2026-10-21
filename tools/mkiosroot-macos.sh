@@ -198,59 +198,36 @@ done
 # broke the v5 run). Hard-fail the build if any compressed file remains so a
 # broken image is never published.
 strip_decmpfs() {
-	# errexit/pipefail must NOT abort the build because xattr -r -l can return
-	# non-zero on this mounted volume (one unreadable xattr) for reasons
-	# unrelated to whether files were actually stripped -- under pipefail that
-	# would kill the script before any file is touched (broke the v4 run).
 	set +e
 	echo "stripping decmpfs compression (XNU has no decmpfs)..."
-
 	# iOS system files are extracted with the system-immutable (schg) and/or
-	# user-immutable (uchg) flag set, which blocks the xattr removal and the
-	# data-fork rewrite below. Clear every immutable flag on the volume first.
+	# user-immutable (uchg) flag set, which blocks inode replacement below.
+	# Clear every immutable flag on the volume first.
 	sudo chflags -R noschg,nouchg,nosappnd,nouappnd,nosunlnk,nouunlnk "$mp" 2>/dev/null
-
-	# Enumerate compressed files once, into a file, via xattr(1).
-	sudo xattr -r -l "$mp" 2>/dev/null | awk '
-		/^[^ \t].*:$/ { p = substr($0, 1, length($0) - 1); next }
-		/com\.apple\.decmpfs/ && p != "" { print p; p = "" }
-	' | sort -u > /tmp/decmpfs_files.txt
-	local before
+	echo "  enumerating compressed files..."
+	# Enumerate per-file via the BSD xattr(1) tool (absolute path so a CI GNU
+	# xattr on PATH cannot interfere). NOT `xattr -r -l`: that aborts on the
+	# first unreadable xattr on this mounted volume and silently yields zero
+	# files (broke v3/v4/v6). A single failure here must not abort the build.
+	sudo find "$mp" -type f -print0 2>/dev/null | sudo xargs -0 -P4 sh -c 'for f in "$@"; do /usr/bin/xattr -p com.apple.decmpfs "$f" >/dev/null 2>&1 && echo "$f"; done' _ > /tmp/decmpfs_files.txt
 	before=$(wc -l < /tmp/decmpfs_files.txt | tr -d ' ')
 	echo "  compressed files detected: $before"
-
 	if [ "$before" -gt 0 ]; then
-		sudo xargs -P4 -I{} sh -c '
-			f="$1"
-			# Belt-and-braces: clear flags per file in case the recursive
-			# clear above missed a freshly linked name.
-			chflags noschg,nouchg "$f" 2>/dev/null || true
-			# Remove the decmpfs marker FIRST so the subsequent rewrite is not
-			# re-compressed by the kext.
-			xattr -d com.apple.decmpfs "$f" 2>/dev/null || true
-			# Rewrite the data fork now that the marker is gone: cat reads the
-			# raw (already-uncompressed) bytes and writes them back plainly.
-			tmp="$(mktemp -p "$mp")"
-			cat "$f" > "$tmp" 2>/dev/null && cat "$tmp" > "$f" 2>/dev/null \
-				|| echo "WARN: could not rewrite $f" >&2
-			rm -f "$tmp"
-		' _ {} < /tmp/decmpfs_files.txt
-		# Defensive second pass: drop any orphaned marker regardless of inode.
-		sudo chflags -R noschg,nouchg "$mp" 2>/dev/null || true
-		sudo xattr -r -d -c com.apple.decmpfs "$mp" 2>/dev/null || true
+		# For each file: read the transparently-decoded bytes into a fresh temp,
+		# then atomically replace the inode. The new inode carries no
+		# com.apple.decmpfs xattr (the marker is gone with the old inode), so the
+		# rewrite is correct whether or not the on-disk data fork was compressed.
+		sudo xargs -P4 -I{} sh -c 'f="$1"; chflags noschg,nouchg "$f" 2>/dev/null || true; tmp="$(mktemp -p "$mp")"; if cat "$f" > "$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null; then :; else cp -p "$tmp" "$f" 2>/dev/null || echo "WARN: could not rewrite $f" >&2; fi; rm -f "$tmp"; /usr/bin/xattr -d com.apple.decmpfs "$f" 2>/dev/null || true' _ {} < /tmp/decmpfs_files.txt
+		echo "  stripped $before files"
 	fi
-
-	# Re-enumerate to confirm the strip actually worked.
-	sudo xattr -r -l "$mp" 2>/dev/null | awk '
-		/^[^ \t].*:$/ { p = substr($0, 1, length($0) - 1); next }
-		/com\.apple\.decmpfs/ && p != "" { print p; p = "" }
-	' | sort -u > /tmp/decmpfs_files2.txt
-	local after
-	after=$(wc -l < /tmp/decmpfs_files2.txt | tr -d ' ')
-	echo "  remaining compressed files: $after (was $before)"
+	# Authoritative re-check on the STILL-MOUNTED volume (no re-mount, which the
+	# CI runner cannot perform -- the old re-mount gate silently skipped and
+	# let broken images through).
+	after=$(sudo find "$mp" -type f -print0 2>/dev/null | sudo xargs -0 -P4 sh -c 'for f in "$@"; do /usr/bin/xattr -p com.apple.decmpfs "$f" >/dev/null 2>&1 && echo "$f"; done' _ | wc -l | tr -d ' ')
+	echo "DECMPFS_CHECK: $after"
 	if [ "$after" -gt 0 ]; then
 		echo "ERROR: decmpfs strip incomplete, $after files still compressed" >&2
-		head -n 20 /tmp/decmpfs_files2.txt | sed 's/^/    /' >&2
+		sudo find "$mp" -type f -print0 2>/dev/null | sudo xargs -0 -P4 sh -c 'for f in "$@"; do /usr/bin/xattr -p com.apple.decmpfs "$f" >/dev/null 2>&1 && echo "$f"; done' _ | head -n 20 | sed 's/^/    /' >&2
 		set -e
 		exit 1
 	fi
@@ -285,28 +262,6 @@ df -h "$mp"
 sudo umount "$mp"
 hdiutil detach "$dev" -force
 
-# Authoritative publisher gate, independent of any literal "com.apple.decmpfs"
-# string embedded in binaries such as AppleDecmpfs.kext. Re-mount the built
-# image and count files that ACTUALLY still carry the com.apple.decmpfs xattr;
-# 0 means the strip succeeded and the kernel will not panic at launchd.
-verify_no_decmpfs() {
-	local vmp n
-	vmp=$(mktemp -d)
-	if ! hdiutil attach -readonly -noverify -mountpoint "$vmp" "$out" >/dev/null 2>&1; then
-		echo "WARN: cannot re-mount $out to verify; skipping gate" >&2
-		return 0
-	fi
-	n=$(sudo xattr -r -l "$vmp" 2>/dev/null | grep -c 'com\.apple\.decmpfs' || true)
-	n=$(printf '%s' "$n" | tr -cd '0-9')
-	n=${n:-0}
-	hdiutil detach "$vmp" -force >/dev/null 2>&1
-	echo "DECMPFS_CHECK: $n files still carry com.apple.decmpfs"
-	if [ "$n" -gt 0 ]; then
-		echo "ERROR: decmpfs strip incomplete; image is broken" >&2
-		exit 1
-	fi
-}
-verify_no_decmpfs
 
 echo "--- volume header (offset 1024) ---"
 xxd -l 16 -s 1024 "$out"
