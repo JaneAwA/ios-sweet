@@ -194,28 +194,35 @@ done
 # v2). Enumerate via the macOS xattr(1) tool instead, and hard-fail the build
 # if any compressed file remains so a broken image is never published.
 strip_decmpfs() {
+	# errexit/pipefail must NOT abort the build because the xattr enumeration
+	# below can return non-zero on this mounted volume for reasons unrelated to
+	# whether files were actually stripped (e.g. one unreadable xattr makes
+	# `xattr -r -l` exit non-zero, which under pipefail would kill the script
+	# before any file is even touched -- exactly what broke the v4 run).
+	set +e
 	echo "stripping decmpfs compression (XNU has no decmpfs)..."
-	detect_compressed() {
-		if command -v xattr >/dev/null 2>&1; then
-			sudo xattr -r -l "$mp" 2>/dev/null | awk '
-				/^[^ \t].*:$/ { p = substr($0, 1, length($0) - 1); next }
-				/com\.apple\.decmpfs/ && p != "" { print p; p = "" }
-			'
-		else
-			sudo /usr/bin/find "$mp" -type f -xattrname com.apple.decmpfs 2>/dev/null
-		fi
-	}
 	# iOS system files are extracted with the system-immutable (schg) and/or
 	# user-immutable (uchg) flag set, which blocks both the in-place data-fork
 	# rewrite and the xattr removal below. Clear every immutable flag on the
 	# whole volume first, or the strip silently leaves every compressed file
 	# intact and the build would otherwise publish a broken image.
-	sudo chflags -R noschg,nouchg "$mp" 2>/dev/null || true
+	sudo chflags -R noschg,nouchg,nosappnd,nouappnd,nosunlnk,nouunlnk "$mp" 2>/dev/null
+	# Enumerate via the native macOS find (absolute path so a stray GNU find on
+	# PATH -- which has no -xattrname and silently matches nothing -- can never
+	# stand in for it). This primary returns a clean exit code; xattr(1) is only
+	# a fallback for the unlikely case find is unavailable.
+	detect_compressed() {
+		/usr/bin/find "$mp" -type f -xattrname com.apple.decmpfs 2>/dev/null \
+			|| sudo xattr -r -l "$mp" 2>/dev/null | awk '
+				/^[^ \t].*:$/ { p = substr($0, 1, length($0) - 1); next }
+				/com\.apple\.decmpfs/ && p != "" { print p; p = "" }
+			'
+	}
 	local before after
 	before=$(detect_compressed | wc -l | tr -d ' ')
 	echo "  compressed files detected: $before"
 	if [ "$before" -gt 0 ]; then
-		detect_compressed | sudo xargs -I{} sh -c '
+		detect_compressed | sudo xargs -P4 -I{} sh -c '
 			f="$1"
 			# Belt-and-braces: clear flags per file in case the recursive
 			# clear above missed anything (e.g. a freshly linked name).
@@ -243,9 +250,11 @@ strip_decmpfs() {
 	if [ "$after" -gt 0 ]; then
 		echo "ERROR: decmpfs strip incomplete, $after files still compressed" >&2
 		detect_compressed | head -n 20 | sed 's/^/    /' >&2
+		set -e
 		exit 1
 	fi
 	echo "decmpfs strip complete"
+	set -e
 }
 strip_decmpfs
 
@@ -274,6 +283,15 @@ sudo install -m 0600 -o 0 -g 0 "$kb" "$mp/private/var/keybags/systembag.kb"
 df -h "$mp"
 sudo umount "$mp"
 hdiutil detach "$dev" -force
+
+# Authoritative publisher gate, independent of the xattr enumeration above:
+# the decmpfs marker string must not appear anywhere in the built image. If it
+# does, a compressed file slipped through and the kernel would panic at launchd,
+# so fail the build rather than publish a broken volume.
+if grep -aq "com.apple.decmpfs" "$out"; then
+	echo "ERROR: decmpfs marker still present in $out; image is broken" >&2
+	exit 1
+fi
 
 echo "--- volume header (offset 1024) ---"
 xxd -l 16 -s 1024 "$out"
