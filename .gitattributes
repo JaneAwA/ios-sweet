@@ -1,0 +1,13 @@
+# Shell scripts and YAML must keep LF endings: the CI runner is macOS and
+# bash silently mis-parses a CRLF script ("$'\r': command not found").
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.py text eol=lf
+*.sh.in text eol=lf
+
+# Binary payloads never get line-ending translation.
+*.img binary
+*.bin binary
+*.adt binary
+*.ipsw binary
