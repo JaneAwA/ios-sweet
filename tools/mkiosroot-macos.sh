@@ -226,7 +226,9 @@ df -h "$mp"
 # ---------------------------------------------------------------------------
 out2="$out.final"
 rm -f "$out2"
-mkfile -n "${size_mb}m" "$out2"
+# +1 GiB headroom over the scratch size: the scratch volume landed at ~90%
+# full (appos is not in the size_mb budget), so give the final image room.
+mkfile -n "$((size_mb + 1024))m" "$out2"
 absout=$(cd "$(dirname "$out2")" && pwd)/$(basename "$out2")
 odev=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$absout")
 odev=$(printf '%s' "$odev" | awk 'NF{print $1}')
@@ -246,12 +248,20 @@ done
 mounts+=("$omp")
 echo "mounted final $omounted at $omp"
 
-# Clear immutable flags on the source so tar can read every file.
-sudo chflags -R noschg,nouchg,nosappnd,nouappnd,nosunlnk,nouunlnk "$mp" 2>/dev/null
+# NOTE: we intentionally do NOT chflags the source ($mp) first. The bulk copy
+# below reads each file's DATA fork through tar, which is unaffected by the
+# source's immutable (schg/uchg) flags -- those only block writes, not reads.
+# Clearing them used to be required for the old per-file 'cat && mv' rewrite
+# (which writes the source); with a streaming copy it is both useless and, on
+# the CI runner, a silent exit-1 (chflags -R trips on system files -> set -e).
 
 # Streaming inflated copy: read through decmpfs (inflates) -> write uncompressed.
 echo "bulk-copying volume (inflating decmpfs) into final image..."
+set +e
 ( cd "$mp" && sudo tar -cf - . ) | ( cd "$omp" && sudo tar -xpf - )
+rc=${PIPESTATUS[1]}
+set -e
+if [ "$rc" -ne 0 ]; then echo "ERROR: bulk copy tar failed (exit $rc)" >&2; exit 1; fi
 echo "bulk copy done"
 
 # Drop any residual decmpfs metadata on the fresh inodes (fast, metadata-only).
