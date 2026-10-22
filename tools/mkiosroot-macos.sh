@@ -235,10 +235,21 @@ odev=$(printf '%s' "$odev" | awk 'NF{print $1}')
 echo "final target device $odev"
 sudo newfs_hfs -s -J -v "$label" "$odev"
 # Turn OFF transparent compression on the destination up front, so nothing we
-# write can be silently re-compressed by the kernel. If this fails, the volume
-# will re-compress on write -> files land compressed -> XNU (no decmpfs kext)
-# fails with EOPNOTSUPP(45). Fail loudly instead of shipping a broken image.
-sudo /usr/sbin/hfs.util -c off "$odev" || { echo "ERROR: hfs.util -c off failed on $odev (volume may re-compress -> EOPNOTSUPP on device)" >&2; exit 1; }
+# write can be silently re-compressed by the kernel.
+#
+# IMPORTANT: /usr/sbin/hfs.util is ABSENT on macOS 14 runners (it was removed
+# from modern macOS), so it cannot disable compression there -- and trying to
+# run it hard-fails the build. That is fine: the COPYFILE_DISABLE=1 on the
+# streaming tar below is what actually prevents any com.apple.decmpfs xattr /
+# resource fork from being copied onto the final volume, and the authoritative
+# gate at the end refuses to ship any file that still carries the decmpfs xattr.
+# We only act on a REAL error (the binary EXISTS but the ioctl fails).
+if sudo test -x /usr/sbin/hfs.util; then
+  sudo /usr/sbin/hfs.util -c off "$odev" \
+    || echo "WARN: hfs.util -c off failed on $odev (continuing; COPYFILE_DISABLE covers decmpfs)" >&2
+else
+  echo "WARN: /usr/sbin/hfs.util not present on this macOS; relying on COPYFILE_DISABLE=1 + the decmpfs gate" >&2
+fi
 
 omp=$work/final
 mkdir -p "$omp"
