@@ -199,31 +199,91 @@ fi
 # ---------------------------------------------------------------------------
 echo "stripping decmpfs marking"
 cat > "$work/strip_decmpfs.py" << 'PYEOF'
+import ctypes
+import ctypes.util
 import os
+import subprocess
 import sys
+
+# macOS has no os.listxattr / os.removexattr (those are Linux APIs), so the
+# libc calls are made directly. listxattr() with a NULL buffer returns the
+# size of the attribute list, which is then read into a buffer.
+_libname = ctypes.util.find_library("c") or "libc.dylib"
+libc = ctypes.CDLL(_libname, use_errno=True)
+
+libc.listxattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p,
+                            ctypes.c_size_t, ctypes.c_int]
+libc.listxattr.restype = ctypes.c_ssize_t
+libc.removexattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
+libc.removexattr.restype = ctypes.c_int
+
+XATTR_NOFOLLOW = 0x0001
+
+
+def list_xattrs(path):
+    """Return the extended attribute names on path, or [] on any error."""
+    enc = os.fsencode(path)
+    size = libc.listxattr(enc, None, 0, XATTR_NOFOLLOW)
+    if size <= 0:
+        return []
+    buf = ctypes.create_string_buffer(size)
+    got = libc.listxattr(enc, buf, size, XATTR_NOFOLLOW)
+    if got <= 0:
+        return []
+    raw = buf.raw[:got]
+    names = []
+    for part in raw.split(b"\x00"):
+        if part:
+            names.append(part.decode("utf-8", "replace"))
+    return names
+
+
+def remove_xattr(path, name):
+    enc = os.fsencode(path)
+    return libc.removexattr(enc, name.encode("utf-8"), XATTR_NOFOLLOW) == 0
+
 
 root = sys.argv[1]
 UF_COMPRESSED = 0x20
 
+# --- self-test -------------------------------------------------------------
+# If the libc plumbing were broken, the whole scan would silently report
+# "nothing to strip" and the image would ship broken. Prove the machinery
+# works on one known file before trusting its verdict over the whole tree.
+probe = os.path.join(root, "bin", "ls")
+if os.path.exists(probe):
+    st = os.lstat(probe)
+    print("PROBE %s attrs=%r flags=0x%x" %
+          (probe, list_xattrs(probe), getattr(st, "st_flags", 0)))
+    try:
+        out = subprocess.run(["xattr", "-l", probe], capture_output=True,
+                             text=True, timeout=30).stdout.strip()
+        print("PROBE xattr(1) says: %r" % out)
+    except Exception as exc:
+        print("PROBE xattr(1) failed: %s" % exc)
+else:
+    print("PROBE: %s does not exist" % probe)
+
+# --- strip -----------------------------------------------------------------
 stripped_attrs = 0
 cleared_flags = 0
+files_with_any_attr = 0
 scanned = 0
+samples = []
 
 for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
     for name in dirnames + filenames:
         path = os.path.join(dirpath, name)
-        try:
-            attrs = os.listxattr(path, follow_symlinks=False)
-        except OSError:
-            continue
+        attrs = list_xattrs(path)
         scanned += 1
+        if attrs:
+            files_with_any_attr += 1
         for a in attrs:
             if a.startswith("com.apple.decmpfs"):
-                try:
-                    os.removexattr(path, a, follow_symlinks=False)
+                if remove_xattr(path, a):
                     stripped_attrs += 1
-                except OSError:
-                    pass
+                    if len(samples) < 5:
+                        samples.append(path)
         try:
             st = os.lstat(path)
         except OSError:
@@ -233,22 +293,24 @@ for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=Fals
                 os.chflags(path, st.st_flags & ~UF_COMPRESSED,
                            follow_symlinks=False)
                 cleared_flags += 1
+                if len(samples) < 5:
+                    samples.append(path)
             except OSError:
                 pass
 
-print("scanned %d inodes, stripped %d decmpfs attributes, cleared %d compressed flags"
-      % (scanned, stripped_attrs, cleared_flags))
+print("scanned %d inodes; %d carry at least one xattr" %
+      (scanned, files_with_any_attr))
+print("stripped %d decmpfs attributes, cleared %d compressed flags" %
+      (stripped_attrs, cleared_flags))
+for s in samples:
+    print("  sample: %s" % s)
 
-# Hard gate: nothing may still be marked compressed.
+# --- hard gate -------------------------------------------------------------
 remaining = 0
 for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
     for name in dirnames + filenames:
         path = os.path.join(dirpath, name)
-        try:
-            attrs = os.listxattr(path, follow_symlinks=False)
-        except OSError:
-            continue
-        if any(a.startswith("com.apple.decmpfs") for a in attrs):
+        if any(a.startswith("com.apple.decmpfs") for a in list_xattrs(path)):
             remaining += 1
             if remaining < 5:
                 print("STILL MARKED: %s" % path)
