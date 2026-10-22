@@ -235,8 +235,10 @@ odev=$(printf '%s' "$odev" | awk 'NF{print $1}')
 echo "final target device $odev"
 sudo newfs_hfs -s -J -v "$label" "$odev"
 # Turn OFF transparent compression on the destination up front, so nothing we
-# write can be silently re-compressed by the kernel.
-sudo /usr/sbin/hfs.util -c off "$odev" 2>/dev/null || true
+# write can be silently re-compressed by the kernel. If this fails, the volume
+# will re-compress on write -> files land compressed -> XNU (no decmpfs kext)
+# fails with EOPNOTSUPP(45). Fail loudly instead of shipping a broken image.
+sudo /usr/sbin/hfs.util -c off "$odev" || { echo "ERROR: hfs.util -c off failed on $odev (volume may re-compress -> EOPNOTSUPP on device)" >&2; exit 1; }
 
 omp=$work/final
 mkdir -p "$omp"
@@ -256,9 +258,14 @@ echo "mounted final $omounted at $omp"
 # the CI runner, a silent exit-1 (chflags -R trips on system files -> set -e).
 
 # Streaming inflated copy: read through decmpfs (inflates) -> write uncompressed.
-echo "bulk-copying volume (inflating decmpfs) into final image..."
+# CRITICAL: COPYFILE_DISABLE=1 stops macOS tar (libarchive copyfile) from copying
+# the com.apple.decmpfs xattr AND the resource fork. Without it, tar carries the
+# decmpfs metadata onto the final volume; macOS then keeps the file "compressed"
+# and XNU (which has no decmpfs kext) cannot read it -> EOPNOTSUPP(45). With it,
+# tar writes the kext-inflated data fork as a plain, uncompressed file.
+echo "bulk-copying volume (inflating decmpfs, COPYFILE_DISABLE=1) into final image..."
 set +e
-( cd "$mp" && sudo tar -cf - . ) | ( cd "$omp" && sudo tar -xpf - )
+( cd "$mp" && sudo env COPYFILE_DISABLE=1 tar -cf - . ) | ( cd "$omp" && sudo env COPYFILE_DISABLE=1 tar -xpf - )
 rc=${PIPESTATUS[1]}
 set -e
 if [ "$rc" -ne 0 ]; then echo "ERROR: bulk copy tar failed (exit $rc)" >&2; exit 1; fi
@@ -290,14 +297,23 @@ echo "DECMPFS_BYTES: $decmpfs_bytes (informational; stale B-tree nodes may infla
 # check is NOT enough, and flag/resource-fork compression survives xattr -d and
 # still trips EOPNOTSUPP(45) on /sbin/launchd. Verify the ACTUAL bytes.
 gate_fail=0
+# Real uncompressed proof: a file is safe for XNU ONLY IF it is a valid Mach-O
+# AND it carries NO com.apple.decmpfs xattr. macOS's decmpfs kext inflates on
+# read, so the Mach-O magic alone is a FALSE pass -- it would pass even for a
+# still-compressed file. We must also require the decmpfs xattr to be absent.
 check_macho() {
 	local p="$1" magic
 	[ -e "$p" ] || return 0
 	magic=$(sudo head -c 4 "$p" | xxd -p)
 	case "$magic" in
-		feedface|feedfacf|cffaedfe|cefaedfe|cafebabe|bebafeca) return 0 ;;
+		feedface|feedfacf|cffaedfe|cefaedfe|cafebabe|bebafeca) ;;
 		*) echo "ERROR: $p is not a valid Mach-O (magic=$magic)" >&2; return 1 ;;
 	esac
+	if sudo xattr -p com.apple.decmpfs "$p" >/dev/null 2>&1; then
+		echo "ERROR: $p still carries com.apple.decmpfs xattr (decmpfs NOT stripped; XNU will EOPNOTSUPP(45))" >&2
+		return 1
+	fi
+	return 0
 }
 for probe in "$omp/sbin/launchd" "$omp/bin/launchd" "$omp/usr/libexec/launchd"; do
 	[ -e "$probe" ] || continue
@@ -307,9 +323,15 @@ dsc="$omp/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64"
 if [ ! -f "$dsc" ] && [ -f "$omp/private/preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64" ]; then
 	dsc="$omp/private/preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64"
 fi
-if [ -f "$dsc" ] && ! head -c 11 "$dsc" | grep -q 'dyld_v1'; then
-	echo "ERROR: dyld shared cache is not inflated" >&2
-	gate_fail=1
+if [ -f "$dsc" ]; then
+	if ! head -c 11 "$dsc" | grep -q 'dyld_v1'; then
+		echo "ERROR: dyld shared cache is not inflated" >&2
+		gate_fail=1
+	fi
+	if sudo xattr -p com.apple.decmpfs "$dsc" >/dev/null 2>&1; then
+		echo "ERROR: dyld shared cache still carries com.apple.decmpfs xattr (decmpfs NOT stripped)" >&2
+		gate_fail=1
+	fi
 fi
 if [ "$gate_fail" -ne 0 ]; then
 	echo "decmpfs gate FAILED -- image is broken" >&2
