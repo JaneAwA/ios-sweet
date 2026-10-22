@@ -216,8 +216,22 @@ libc.listxattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p,
 libc.listxattr.restype = ctypes.c_ssize_t
 libc.removexattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
 libc.removexattr.restype = ctypes.c_int
+# CRITICAL: macOS's setxattr() has SIX parameters -- it takes a `position`
+# argument that Linux's does not:
+#
+#   int setxattr(const char *path, const char *name, void *value,
+#                size_t size, u_int32_t position, int options);
+#
+# Declaring only five (the Linux signature) shifts every argument after
+# `size` by one register: `position` receives the intended `options` value
+# and `options` receives garbage. The call then fails, the round-trip probe
+# reads back an empty list, and the scan concludes "no file carries any
+# xattr" -- a FALSE NEGATIVE that green-lights a volume whose inodes still
+# carry the decmpfs attribute. That is exactly how a broken image got
+# published before, so the signature here must match Darwin's exactly.
 libc.setxattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p,
-                           ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+                           ctypes.c_void_p, ctypes.c_size_t,
+                           ctypes.c_uint32, ctypes.c_int]
 libc.setxattr.restype = ctypes.c_int
 
 XATTR_NOFOLLOW = 0x0001
@@ -226,8 +240,9 @@ XATTR_NOFOLLOW = 0x0001
 def set_xattr(path, name, value):
     enc = os.fsencode(path)
     buf = ctypes.create_string_buffer(value, len(value))
+    # position = 0, options = XATTR_NOFOLLOW (Darwin signature).
     return libc.setxattr(enc, name.encode("utf-8"), buf, len(value),
-                         XATTR_NOFOLLOW) == 0
+                         0, XATTR_NOFOLLOW) == 0
 
 
 def list_xattrs(path):
@@ -253,6 +268,17 @@ def remove_xattr(path, name):
     return libc.removexattr(enc, name.encode("utf-8"), XATTR_NOFOLLOW) == 0
 
 
+def xattr_cli(path, *args):
+    """Run xattr(1) and return (rc, stdout). The CLI is a second, independent
+    implementation of the same query, so it can cross-check the ctypes path."""
+    try:
+        r = subprocess.run(["xattr"] + list(args) + [path], capture_output=True,
+                           text=True, timeout=60)
+        return r.returncode, (r.stdout or "").strip()
+    except Exception as exc:                      # noqa: BLE001
+        return -1, str(exc)
+
+
 root = sys.argv[1]
 UF_COMPRESSED = 0x20
 
@@ -265,24 +291,51 @@ UF_COMPRESSED = 0x20
 # So: create a file, set a known attribute on it, read it back, and delete
 # it again. If the round trip fails, the scan cannot be trusted and the
 # build must stop.
+#
+# The read-back is done TWICE, through two independent implementations:
+#   - listxattr(2) via ctypes
+#   - xattr(1) via the command line
+# Both must agree that the attribute is there, and both must agree that it
+# is gone after removal. A single implementation can be silently broken (the
+# wrong prototype shifts every argument after `size` by one register, so the
+# write fails and the read-back returns an empty list -- which reads as
+# "nothing is marked" rather than as an error).
 probe_dir = os.path.join(root, ".decmpfs-probe")
 probe = os.path.join(probe_dir, "probe")
 os.makedirs(probe_dir, exist_ok=True)
 with open(probe, "wb") as fh:
     fh.write(b"probe")
-set_xattr(probe, "com.apple.decmpfs", b"\x00" * 16)
+
+if not set_xattr(probe, "com.apple.decmpfs", b"\x00" * 16):
+    print("ERROR: setxattr() failed on the probe file (errno %d)."
+          % (ctypes.get_errno(),))
+    print("       The xattr API is not usable here, so the scan below cannot")
+    print("       distinguish 'no attribute' from 'cannot read attributes'.")
+    sys.exit(2)
+
 back = list_xattrs(probe)
-print("PROBE setxattr/listxattr round trip: %r" % (back,))
+rc_cli, cli_out = xattr_cli(probe, "-p", "com.apple.decmpfs")
+print("PROBE listxattr(2) -> %r" % (back,))
+print("PROBE xattr(1)    -> rc=%d %r" % (rc_cli, cli_out))
 probe_ok = any(a == "com.apple.decmpfs" for a in back)
 if not probe_ok:
     print("ERROR: the xattr probe did not read back -- listxattr is not")
     print("       trustworthy here, so the decmpfs verdict below is meaningless.")
     sys.exit(2)
-print("PROBE xattr(1) says: %r" %
-      subprocess.run(["xattr", "-l", probe], capture_output=True,
-                     text=True, timeout=30).stdout.strip())
+if rc_cli != 0:
+    print("ERROR: xattr(1) cannot read the attribute the ctypes path just")
+    print("       wrote; the two disagree, so neither can be trusted.")
+    sys.exit(2)
+
 remove_xattr(probe, "com.apple.decmpfs")
-print("PROBE after removal: %r" % (list_xattrs(probe),))
+after = list_xattrs(probe)
+rc_after, cli_after = xattr_cli(probe, "-p", "com.apple.decmpfs")
+print("PROBE after removal: listxattr(2) -> %r, xattr(1) rc=%d" %
+      (after, rc_after))
+if any(a == "com.apple.decmpfs" for a in after) or rc_after == 0:
+    print("ERROR: the xattr probe could not be removed -- the strip pass")
+    print("       would silently fail for every inode.")
+    sys.exit(2)
 os.unlink(probe)
 os.rmdir(probe_dir)
 
@@ -291,6 +344,7 @@ stripped_attrs = 0
 cleared_flags = 0
 files_with_any_attr = 0
 scanned = 0
+list_errors = 0
 samples = []
 
 for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
@@ -326,6 +380,39 @@ print("stripped %d decmpfs attributes, cleared %d compressed flags" %
       (stripped_attrs, cleared_flags))
 for s in samples:
     print("  sample: %s" % s)
+
+# --- verify ----------------------------------------------------------------
+# Second, independent pass: the volume must now be clean. Re-walk and look
+# for anything left. The xattr query is done through BOTH implementations
+# again, so a failure of either one is visible instead of being read as
+# "clean".
+leftover_attr = 0
+leftover_flag = 0
+rescanned = 0
+for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+    for name in dirnames + filenames:
+        path = os.path.join(dirpath, name)
+        rescanned += 1
+        for a in list_xattrs(path):
+            if a.startswith("com.apple.decmpfs"):
+                leftover_attr += 1
+                if leftover_attr <= 5:
+                    print("  LEFTOVER xattr: %s (%s)" % (path, a))
+        try:
+            st = os.lstat(path)
+        except OSError:
+            continue
+        if getattr(st, "st_flags", 0) & UF_COMPRESSED:
+            leftover_flag += 1
+            if leftover_flag <= 5:
+                print("  LEFTOVER UF_COMPRESSED: %s" % path)
+
+print("verification pass: %d inodes re-scanned, %d leftover decmpfs xattrs, "
+      "%d leftover UF_COMPRESSED flags" %
+      (rescanned, leftover_attr, leftover_flag))
+if leftover_attr or leftover_flag:
+    print("ERROR: the volume is still marked as compressed after stripping")
+    sys.exit(3)
 
 # --- hard gate -------------------------------------------------------------
 remaining = 0
