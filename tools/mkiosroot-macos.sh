@@ -302,7 +302,7 @@ hdiutil detach "$dev" -force
 # NOTE: a failed grep used to be swallowed by `|| true` and silently reported
 # as 0, which looked like a clean image -- that is how a broken image shipped
 # with "DECMPFS_BYTES: 0". Report scan failures loudly instead.
-decmpfs_hits="$tmp/decmpfs.hits"
+decmpfs_hits="$work/decmpfs.hits"
 grep -ao 'com.apple.decmpfs' "$out2" > "$decmpfs_hits" 2>/dev/null
 grep_rc=$?
 decmpfs_bytes=$(wc -l < "$decmpfs_hits" | tr -d ' ')
