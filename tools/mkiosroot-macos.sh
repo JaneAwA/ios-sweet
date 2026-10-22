@@ -466,7 +466,11 @@ check_macho() {
 	magic=$(sudo head -c 4 "$p" | xxd -p)
 	case "$magic" in
 		feedface|feedfacf|cffaedfe|cefaedfe|cafebabe|bebafeca) ;;
-		*) echo "ERROR: $p is not a valid Mach-O (magic=$magic)" >&2; return 1 ;;
+		# The dyld shared cache is NOT a Mach-O: it starts with the ASCII
+		# "dyld" followed by the version ("dyld_v1 ..."). Rejecting it here
+		# would block a perfectly good image.
+		64796c64) ;;
+		*) echo "ERROR: $p is not a valid Mach-O or dyld cache (magic=$magic)" >&2; return 1 ;;
 	esac
 	if sudo xattr -p com.apple.decmpfs "$p" >/dev/null 2>&1; then
 		echo "ERROR: $p still carries the com.apple.decmpfs xattr" >&2
