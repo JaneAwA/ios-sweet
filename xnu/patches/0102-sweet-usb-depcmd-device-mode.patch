@@ -1,7 +1,6 @@
 --- a/bsd/dev/sweet_usb.c
 +++ b/bsd/dev/sweet_usb.c
-@@ -233,19 +233,23 @@
- 	dwc_wr(DEPCMDPAR0(ep), p0);
+@@ -273,7 +273,7 @@ ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
  	dwc_wr(DEPCMDPAR1(ep), p1);
  	dwc_wr(DEPCMDPAR2(ep), p2);
  	dwc_wr(DEPCMD(ep), cmd | DEPCMD_CMDACT);
@@ -10,11 +9,7 @@
  		uint32_t v = dwc_rd(DEPCMD(ep));
  		if (!(v & DEPCMD_CMDACT)) {
  			uint32_t status = (v >> 12) & 0xf;
- 			if (status) {
- 				printf("SWEET USB: ep%u cmd 0x%x status %u\n", ep, cmd & 0xf, status);
- 				return -1;
- 			}
- 			return 0;
+@@ -285,7 +285,9 @@ ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
  		}
  		delay(1);
  	}
@@ -24,8 +19,8 @@
 +	    dwc_rd(DEPCMDPAR2(ep)), dwc_rd(DCTL), dwc_rd(DSTS));
  	return -1;
  }
-@@ -510,5 +510,10 @@
- 	if (dwc_rd(DCTL) & DCTL_CSFTRST) {
+ 
+@@ -878,6 +880,12 @@ sweet_usb_gadget_start(vm_offset_t dwc)
  		return;
  	}
  
@@ -36,9 +31,11 @@
 +	dwc_wr(GCTL, (dwc_rd(GCTL) & ~(3u << 13)) | (1u << 13));
 +
  	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
+ 	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
+ 	dwc_wr(GEVNTSIZ, (1u << 31) | UD_EVT_SIZE);     /* interrupt masked: polled */
 --- a/osfmk/console/serial_console.c
 +++ b/osfmk/console/serial_console.c
-@@ -282,8 +282,7 @@
+@@ -282,7 +282,6 @@ _cnputs(char *c, int size, bool poll)
  	extern int disableConsoleOutput;
  
  #if defined(ARM64_BOARD_CONFIG_SWEET)
@@ -46,19 +43,18 @@
  	if (sweet_console_muted && !panic_active()) {
  		return;
  	}
- #endif
-@@ -529,6 +529,13 @@
- void
- console_write(char *str, int size)
+@@ -531,6 +530,14 @@ console_write(char *str, int size)
  {
  	assert(str != NULL);
  
-+	#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET)
 +	/* The video console draws straight from the console ring on this port,
 +	 * so _cnputs() is never reached for normal output and the persistent
 +	 * log (patch 0047) stayed empty. console_write() is the single entry
 +	 * point for all console output (kernel printf and /dev/console). */
 +	sweet_log_append(str, size);
-+	#endif
++#endif
 +
  	char *write_ptr = NULL;
+ 	int chunk_size = CPU_CONS_BUF_SIZE;
+ 	int i = 0;
