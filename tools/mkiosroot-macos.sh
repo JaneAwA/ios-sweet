@@ -76,18 +76,46 @@ pick_root() {
 }
 osroot=$(pick_root "$work/os")
 sysroot=$(pick_root "$work/sysos")
-sources=("$osroot" "$sysroot")
+approot=$(pick_root "$work/appos")
+sources=("$osroot" "$sysroot" "$approot")
 for s in "${sources[@]}"; do
 	[[ -d $s ]] || { echo "no root/ inside $s" >&2; exit 1; }
 done
 
 # Size the volume from what is going into it: an oversized image is gigabytes
 # of nothing to download and to flash, and a too-small one dies midway.
-# du counts hard-linked files once, which is what the destination does too.
-need=$(sudo du -sk "${sources[@]}" | awk '{s += $1} END {print s}')
+#
+# The size must be the UNCOMPRESSED (logical) size of the payload, and it
+# must include EVERYTHING that lands on the volume.
+#
+# Two things bit us here:
+#
+#  1. du reports ALLOCATED blocks. On the source images the files are
+#     decmpfs-compressed, so their allocated size is much smaller than the
+#     bytes the copy actually writes (the copy inflates them, because the
+#     destination is a plain uncompressed HFS+ volume). Budgeting from du
+#     therefore under-counts by roughly the compression ratio, and the copy
+#     dies with "tar: Write to restore size failed" (ENOSPC) partway through.
+#
+#  2. The AppOS cryptex was never in the budget at all, so the third copy()
+#     had nowhere to go even in principle.
+#
+# So: measure the LOGICAL size with du -skA (apparent size, hard-linked files
+# counted once, like the destination does) over all three source trees, and
+# then add the headroom the caller asked for on top.
+#
+# NOTE: BSD du uses -A for apparent size. -L is NOT it -- -L means
+# "dereference symlinks". Using -L would measure the symlink targets, which
+# is not what the copy writes.
+need=0
+for s in "${sources[@]}"; do
+	k=$(sudo du -skA "$s" | awk '{print $1}')
+	echo "  $(basename "$s"): $k KB logical"
+	need=$((need + k))
+done
 total_kb=$((need + headroom))
 size_mb=$((total_kb / 1024))
-echo "content ${need} KB -> ${size_mb} MB volume (+$((total_kb - need)) KB headroom)"
+echo "content ${need} KB logical -> ${size_mb} MB volume (+$((total_kb - need)) KB headroom)"
 
 rm -f "$out"
 mkfile -n "${size_mb}m" "$out"
@@ -224,95 +252,31 @@ sudo install -m 0600 -o 0 -g 0 "$kb" "$mp/private/var/keybags/systembag.kb"
 df -h "$mp"
 
 # ---------------------------------------------------------------------------
-# Finalize: bulk-copy the assembled volume into the OUTPUT image with HFS+
-# transparent compression turned OFF.
+# Finalize: flush the assembled volume to the output image.
 #
-# The assembled scratch volume ($mp) may still carry decmpfs metadata (the
-# com.apple.decmpfs xattr and, for some files, the HFS_FILE_COMPRESSED flag /
-# resource-fork form) even though the data forks were inflated by the BSD tar
-# copy() during assembly. Rather than rewriting files one-by-one (slow, and it
-# left the gate toothless), we stream the whole volume through a second tar
-# pass: macOS reads every file through the decmpfs kext -- so any still-
-# compressed payload is inflated -- and writes fresh inodes onto a
-# non-compressing volume. One streaming pass strips both compression forms and
-# is dramatically faster than per-file rewrites.
+# There is deliberately only ONE volume here. The upstream recipe had two (an
+# assembly scratch volume plus a final copy of it), because the final copy was
+# meant to strip the decmpfs metadata that bsdtar had carried over. That
+# stripping is now done at the source instead: copy() extracts with
+# --no-mac-metadata --no-xattrs, so the files land on the volume as plain,
+# uncompressed, xattr-free inodes in the first place, and a second full copy
+# of the tree has nothing left to do.
+#
+# Dropping it is not just a speed-up, it is a REQUIREMENT: with the xattrs
+# stripped the files are stored expanded, so the volume needs the logical
+# (uncompressed) size rather than the compressed one, and two such volumes at
+# once do not fit on the CI runner's disk.
 # ---------------------------------------------------------------------------
-out2="$out.final"
-rm -f "$out2"
-# +1 GiB headroom over the scratch size: the scratch volume landed at ~90%
-# full (appos is not in the size_mb budget), so give the final image room.
-mkfile -n "$((size_mb + 1024))m" "$out2"
-absout=$(cd "$(dirname "$out2")" && pwd)/$(basename "$out2")
-odev=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$absout")
-odev=$(printf '%s' "$odev" | awk 'NF{print $1}')
-echo "final target device $odev"
-sudo newfs_hfs -s -J -v "$label" "$odev"
-# Turn OFF transparent compression on the destination up front, so nothing we
-# write can be silently re-compressed by the kernel.
-#
-# IMPORTANT: /usr/sbin/hfs.util is ABSENT on macOS 14 runners (it was removed
-# from modern macOS), so it cannot disable compression there -- and trying to
-# run it hard-fails the build. That is fine: the COPYFILE_DISABLE=1 on the
-# streaming tar below is what actually prevents any com.apple.decmpfs xattr /
-# resource fork from being copied onto the final volume, and the authoritative
-# gate at the end refuses to ship any file that still carries the decmpfs xattr.
-# We only act on a REAL error (the binary EXISTS but the ioctl fails).
-if sudo test -x /usr/sbin/hfs.util; then
-  sudo /usr/sbin/hfs.util -c off "$odev" \
-    || echo "WARN: hfs.util -c off failed on $odev (continuing; COPYFILE_DISABLE covers decmpfs)" >&2
-else
-  echo "WARN: /usr/sbin/hfs.util not present on this macOS; relying on COPYFILE_DISABLE=1 + the decmpfs gate" >&2
-fi
-
-omp=$work/final
-mkdir -p "$omp"
-omounted=""
-for cand in "$odev" "${odev}s1"; do
-	[[ -b $cand ]] && sudo mount_hfs "$cand" "$omp" 2>/dev/null && { omounted=$cand; break; }
-done
-[[ -z $omounted ]] && { echo "could not mount final $odev" >&2; exit 1; }
-mounts+=("$omp")
-echo "mounted final $omounted at $omp"
-
-# NOTE: we intentionally do NOT chflags the source ($mp) first. The bulk copy
-# below reads each file's DATA fork through tar, which is unaffected by the
-# source's immutable (schg/uchg) flags -- those only block writes, not reads.
-# Clearing them used to be required for the old per-file 'cat && mv' rewrite
-# (which writes the source); with a streaming copy it is both useless and, on
-# the CI runner, a silent exit-1 (chflags -R trips on system files -> set -e).
-
-# Streaming inflated copy: read through decmpfs (inflates) -> write uncompressed.
-# CRITICAL: --no-mac-metadata (and the individual --no-* flags) is what
-# actually keeps the decmpfs metadata off the final volume. COPYFILE_DISABLE=1
-# alone is NOT enough: bsdtar stores extended attributes in the archive
-# and restores them with setxattr(2), a path that never goes through
-# copyfile(3), so the com.apple.decmpfs xattr was still carried over and
-# the finished volume kept /sbin/launchd "compressed". XNU has no
-# AppleFSCompression kext (decmpfs type 4 is "unregistered"), so execve()
-# of that file failed with EOPNOTSUPP (errno 45) and the kernel panicked.
-echo "bulk-copying volume (inflating decmpfs, --no-mac-metadata) into final image..."
-# CRITICAL: COPYFILE_DISABLE=1 stops macOS tar (libarchive copyfile) from copying
-# the com.apple.decmpfs xattr AND the resource fork. Without it, tar carries the
-# decmpfs metadata onto the final volume; macOS then keeps the file "compressed"
-# and XNU (which has no decmpfs kext) cannot read it -> EOPNOTSUPP(45). With it,
-# tar writes the kext-inflated data fork as a plain, uncompressed file.
-echo "bulk-copying volume (inflating decmpfs, COPYFILE_DISABLE=1) into final image..."
-set +e
-( cd "$mp" && sudo env COPYFILE_DISABLE=1 tar -cf - . ) | ( cd "$omp" && sudo env COPYFILE_DISABLE=1 tar -xpf - )
-rc=${PIPESTATUS[1]}
-set -e
-if [ "$rc" -ne 0 ]; then echo "ERROR: bulk copy tar failed (exit $rc)" >&2; exit 1; fi
-echo "bulk copy done"
-
-
-
 echo "--- volume header (offset 1024) ---"
-xxd -l 16 -s 1024 "$out2"
+xxd -l 16 -s 1024 "$out"
 
-# Promote the final image: $out is what the caller / sparse step expects.
-sudo umount "$omp"
-hdiutil detach "$odev" -force
-mv -f "$out2" "$out"
+# Unmount and detach BEFORE the gate below: while the volume is mounted the
+# filesystem serves reads from its own cache and the backing file on disk
+# still holds the pre-copy content, so a scan of the image file sees stale
+# bytes. That false negative is exactly how a broken image shipped as
+# "DECMPFS_BYTES: 0" once before.
+sudo umount "$mp"
+hdiutil detach "$dev" -force
 echo "final image written to $out"
 
 # ---------------------------------------------------------------------------
