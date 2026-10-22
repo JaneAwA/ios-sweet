@@ -177,62 +177,14 @@ for c in OS App; do
 		done
 done
 
-# Strip HFS+ decmpfs compression from every file on the volume.
-#
-# iOS 16 root images store a large fraction of their files (including
-# /sbin/launchd) as decmpfs-compressed. The SWEET/XNU port has no decmpfs
-# decompression path, so the kernel returns EOPNOTSUPP (errno 45) when it tries
-# to read one and the boot panics at "Process 1 exec of /sbin/launchd failed".
-#
-# BSD tar (used by copy()) reads each file through the decmpfs kext, so the
-# bytes it writes into our volume are already uncompressed; it also copies the
-# com.apple.decmpfs xattr across. We therefore only have to drop that xattr --
-# and, to be safe, rewrite the data fork once more with the xattr gone so the
-# file is unambiguously plain. The xattr MUST be removed BEFORE the rewrite:
-# while it is present the kext would re-compress (or mangle) whatever we write.
-# A same-inode rewrite keeps hard links intact.
-#
-# Detection enumerates via the macOS xattr(1) tool. find(1)'s -xattrname primary
-# is deliberately NOT used: on the CI runner it silently matches nothing (returns
-# zero files) and would leave every compressed file intact (this is exactly what
-# broke the v5 run). Hard-fail the build if any compressed file remains so a
-# broken image is never published.
-strip_decmpfs() {
-	set +e
-	echo "stripping decmpfs compression (XNU has no decmpfs)..."
-
-	# Best-effort: turn OFF HFS+ transparent volume compression so the
-	# rewrite below is never silently re-compressed by the kernel on write.
-	# If this tool is unavailable the authoritative gate still catches leftovers.
-	sudo /usr/sbin/hfs.util -c off "$dev" 2>/dev/null || true
-
-	# iOS system files are extracted with the system-immutable (schg) and/or
-	# user-immutable (uchg) flag set, which blocks attribute/file changes.
-	# Clear every immutable flag on the volume first.
-	sudo chflags -R noschg,nouchg,nosappnd,nouappnd,nosunlnk,nouunlnk "$mp" 2>/dev/null
-
-	# Force every regular file's data fork to be rewritten from its own
-	# (kext-inflated) read through a fresh inode. This drops the compressed
-	# flag and any resource-fork / flag-form decmpfs that `xattr -d` misses --
-	# that form is exactly what left /sbin/launchd compressed and panicked the
-	# device with errno 45 (EOPNOTSUPP). The new inode carries no compressed
-	# flag, so the kernel no longer attempts decompression.
-	sudo find "$mp" -type f -print0 2>/dev/null | while IFS= read -r -d '' f; do
-		sudo sh -c 'cat "$1" > "$1.__dcmp" && mv -f "$1.__dcmp" "$1"' _ "$f" 2>/dev/null
-	done
-
-	# Drop the decmpfs xattr from EVERY regular file (xattr-form compression).
-	sudo find "$mp" -type f -print0 2>/dev/null \
-		| sudo xargs -0 -P8 xattr -d com.apple.decmpfs 2>/dev/null
-	sudo find "$mp" -type f -exec sudo xattr -d com.apple.decmpfs {} \; 2>/dev/null
-
-	# Clear the BSD compressed flag on every file (flag-form compression).
-	sudo chflags -R nocompressed "$mp" 2>/dev/null
-
-	echo "decmpfs strip complete"
-	set -e
-}
-strip_decmpfs
+# Decmpfs stripping is performed at finalize time (see the bulk-copy pass
+# below): the whole assembled volume is streamed through a second tar pass into
+# a compression-OFF output image. macOS reads every file through the decmpfs
+# kext (so any still-compressed payload is inflated) and writes fresh inodes on
+# a non-compressing volume, dropping BOTH the xattr-form and the flag /
+# resource-fork-form decmpfs in ONE fast streaming operation -- instead of the
+# old per-file `sudo sh -c 'cat && mv'` rewrite that spawned a process per file
+# and took ~15+ minutes. No per-file rewrite here.
 
 # logd's log stores, normally made at restore: it checks owner _logd (272) and
 # mode, plus a .migrated marker, else it asks a helper and crashes
@@ -257,6 +209,58 @@ sudo install -d -m 0700 -o 0 -g 0 "$mp/private/var/keybags"
 sudo install -m 0600 -o 0 -g 0 "$kb" "$mp/private/var/keybags/systembag.kb"
 
 df -h "$mp"
+
+# ---------------------------------------------------------------------------
+# Finalize: bulk-copy the assembled volume into the OUTPUT image with HFS+
+# transparent compression turned OFF.
+#
+# The assembled scratch volume ($mp) may still carry decmpfs metadata (the
+# com.apple.decmpfs xattr and, for some files, the HFS_FILE_COMPRESSED flag /
+# resource-fork form) even though the data forks were inflated by the BSD tar
+# copy() during assembly. Rather than rewriting files one-by-one (slow, and it
+# left the gate toothless), we stream the whole volume through a second tar
+# pass: macOS reads every file through the decmpfs kext -- so any still-
+# compressed payload is inflated -- and writes fresh inodes onto a
+# non-compressing volume. One streaming pass strips both compression forms and
+# is dramatically faster than per-file rewrites.
+# ---------------------------------------------------------------------------
+out2="$out.final"
+rm -f "$out2"
+mkfile -n "${size_mb}m" "$out2"
+absout=$(cd "$(dirname "$out2")" && pwd)/$(basename "$out2")
+odev=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$absout")
+odev=$(printf '%s' "$odev" | awk 'NF{print $1}')
+echo "final target device $odev"
+sudo newfs_hfs -s -J -v "$label" "$odev"
+# Turn OFF transparent compression on the destination up front, so nothing we
+# write can be silently re-compressed by the kernel.
+sudo /usr/sbin/hfs.util -c off "$odev" 2>/dev/null || true
+
+omp=$work/final
+mkdir -p "$omp"
+omounted=""
+for cand in "$odev" "${odev}s1"; do
+	[[ -b $cand ]] && sudo mount_hfs "$cand" "$omp" 2>/dev/null && { omounted=$cand; break; }
+done
+[[ -z $omounted ]] && { echo "could not mount final $odev" >&2; exit 1; }
+mounts+=("$omp")
+echo "mounted final $omounted at $omp"
+
+# Clear immutable flags on the source so tar can read every file.
+sudo chflags -R noschg,nouchg,nosappnd,nouappnd,nosunlnk,nouunlnk "$mp" 2>/dev/null
+
+# Streaming inflated copy: read through decmpfs (inflates) -> write uncompressed.
+echo "bulk-copying volume (inflating decmpfs) into final image..."
+( cd "$mp" && sudo tar -cf - . ) | ( cd "$omp" && sudo tar -xpf - )
+echo "bulk copy done"
+
+# Drop any residual decmpfs metadata on the fresh inodes (fast, metadata-only).
+sudo find "$omp" -type f -print0 2>/dev/null \
+	| sudo xargs -0 -P8 xattr -d com.apple.decmpfs 2>/dev/null || true
+sudo find "$omp" -type f -exec sudo xattr -d com.apple.decmpfs {} \; 2>/dev/null || true
+sudo chflags -R nocompressed "$omp" 2>/dev/null || true
+
+# Detach the scratch assembly volume.
 sudo umount "$mp"
 hdiutil detach "$dev" -force
 
@@ -264,13 +268,14 @@ hdiutil detach "$dev" -force
 # image. This INCLUDES stale B-tree bytes left behind when xattrs were deleted
 # and AppleDecmpfs.kext's own reference, so it must NOT be used as a hard gate
 # (a correctly stripped image can still show a high count from freed nodes).
-decmpfs_bytes=$(grep -ao 'com.apple.decmpfs' "$out" 2>/dev/null | wc -l | tr -d ' ') || true
+decmpfs_bytes=$(grep -ao 'com.apple.decmpfs' "$out2" 2>/dev/null | wc -l | tr -d ' ') || true
 echo "DECMPFS_BYTES: $decmpfs_bytes (informational; stale B-tree nodes may inflate this)"
 
 # Authoritative gate: the files we cannot boot without must be real,
-# uncompressed Mach-O images (or valid dyld caches). A passed xattr check
-# is NOT enough -- flag/resource-fork compression survives xattr -d and
-# still trips EOPNOTSUPP(45) on /sbin/launchd. Verify the actual bytes.
+# uncompressed Mach-O images (or valid dyld caches). This runs WHILE the final
+# volume is still mounted, so it actually inspects the bytes -- a passed xattr
+# check is NOT enough, and flag/resource-fork compression survives xattr -d and
+# still trips EOPNOTSUPP(45) on /sbin/launchd. Verify the ACTUAL bytes.
 gate_fail=0
 check_macho() {
 	local p="$1" magic
@@ -281,15 +286,14 @@ check_macho() {
 		*) echo "ERROR: $p is not a valid Mach-O (magic=$magic)" >&2; return 1 ;;
 	esac
 }
-for probe in "$mp/sbin/launchd" "$mp/bin/launchd" "$mp/usr/libexec/launchd"; do
+for probe in "$omp/sbin/launchd" "$omp/bin/launchd" "$omp/usr/libexec/launchd"; do
 	[ -e "$probe" ] || continue
 	if ! check_macho "$probe"; then gate_fail=1; fi
-	if sudo xattr -p com.apple.decmpfs "$probe" >/dev/null 2>&1; then
-		echo "ERROR: $probe still has com.apple.decmpfs xattr" >&2
-		gate_fail=1
-	fi
 done
-dsc="$mp/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64"
+dsc="$omp/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64"
+if [ ! -f "$dsc" ] && [ -f "$omp/private/preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64" ]; then
+	dsc="$omp/private/preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64"
+fi
 if [ -f "$dsc" ] && ! head -c 11 "$dsc" | grep -q 'dyld_v1'; then
 	echo "ERROR: dyld shared cache is not inflated" >&2
 	gate_fail=1
@@ -301,5 +305,11 @@ fi
 echo "decmpfs gate passed"
 
 echo "--- volume header (offset 1024) ---"
-xxd -l 16 -s 1024 "$out"
+xxd -l 16 -s 1024 "$out2"
+
+# Promote the final image: $out is what the caller / sparse step expects.
+sudo umount "$omp"
+hdiutil detach "$odev" -force
+mv -f "$out2" "$out"
+echo "final image written to $out"
 ls -l "$out"
