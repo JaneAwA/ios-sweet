@@ -297,12 +297,35 @@ echo "final image written to $out"
 # finished image means some file is still marked decmpfs-compressed, and XNU
 # (no AppleFSCompression kext -> decmpfs type 4 is "unregistered") cannot read
 # it. Refuse to publish the image instead of shipping another boot loop.
-decmpfs_hits="$work/decmpfs.hits"
-grep -ao 'com.apple.decmpfs' "$out" > "$decmpfs_hits" 2>/dev/null
-grep_rc=$?
-decmpfs_bytes=$(wc -l < "$decmpfs_hits" | tr -d ' ')
-if [ "$grep_rc" -gt 1 ]; then
-	echo "ERROR: decmpfs scan FAILED (grep rc=$grep_rc) -- cannot verify the image" >&2
+#
+# The scan is done by a small Python streamer, NOT by grep. The image is a
+# 13 GB binary blob with no newlines in it, and grep -a treats the whole
+# file as ONE line -- it buffers the entire thing in memory and the runner
+# OOM-kills it ("Killed: 9"). The streamer keeps a fixed-size window and
+# counts the pattern across chunk boundaries.
+decmpfs_bytes=$(python3 - "$out" << 'PYEOF'
+import sys
+
+path = sys.argv[1]
+needle = b"com.apple.decmpfs"
+overlap = len(needle) - 1
+count = 0
+tail = b""
+
+with open(path, "rb") as fh:
+    while True:
+        chunk = fh.read(8 * 1024 * 1024)
+        if not chunk:
+            break
+        buf = tail + chunk
+        count += buf.count(needle)
+        tail = buf[-overlap:] if overlap else b""
+
+print(count)
+PYEOF
+)
+if [ -z "$decmpfs_bytes" ]; then
+	echo "ERROR: decmpfs scan produced no result -- cannot verify the image" >&2
 	exit 1
 fi
 echo "DECMPFS_BYTES: $decmpfs_bytes (post-unmount, authoritative)"
@@ -311,7 +334,6 @@ if [ "$decmpfs_bytes" -ne 0 ]; then
 	echo "       Those files are still marked compressed; XNU cannot decode them" >&2
 	echo "       (decmpfs type 4 is unregistered) and execve() fails with errno 45." >&2
 	echo "       NOT publishing this image." >&2
-	sed -n '1,5p' "$decmpfs_hits" >&2
 	exit 1
 fi
 echo "decmpfs gate passed (image is clean)"
