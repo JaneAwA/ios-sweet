@@ -264,11 +264,14 @@ set -e
 if [ "$rc" -ne 0 ]; then echo "ERROR: bulk copy tar failed (exit $rc)" >&2; exit 1; fi
 echo "bulk copy done"
 
-# Drop any residual decmpfs metadata on the fresh inodes (fast, metadata-only).
-sudo find "$omp" -type f -print0 2>/dev/null \
-	| sudo xargs -0 -P8 xattr -d com.apple.decmpfs 2>/dev/null || true
-sudo find "$omp" -type f -exec sudo xattr -d com.apple.decmpfs {} \; 2>/dev/null || true
-sudo chflags -R nocompressed "$omp" 2>/dev/null || true
+# NOTE: we intentionally do NOT run a per-file xattr -d / chflags pass on $omp.
+# bsdtar (tar -xpf) does NOT copy xattrs or BSD flags by default, so the fresh
+# inodes on the final volume carry NEITHER com.apple.decmpfs xattrs NOR the
+# nocompressed flag -- those residual-cleanup lines were pure no-ops that
+# forked a process per file across hundreds of thousands of files, looking
+# exactly like a hang. The final volume's compression is already OFF
+# (hfs.util -c off on $odev) and the payloads were inflated during the copy,
+# so nothing remains to strip. The authoritative Mach-O gate below confirms it.
 
 # Detach the scratch assembly volume.
 sudo umount "$mp"
