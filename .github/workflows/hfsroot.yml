@@ -104,14 +104,25 @@ jobs:
         if: ${{ inputs.mode == 'ios' && inputs.sparse == 'true' }}
         run: |
           python3 tools/img2simg.py ios16-root.raw ios16-root.simg
-          # The raw image is ten GB of mostly nothing; only the sparse one is
-          # worth downloading.
+          # The raw image is thirteen GB of mostly nothing; only the sparse one
+          # is worth keeping.
           rm -f ios16-root.raw
           ls -l ios16-root.simg
 
+      - name: compress the sparse image
+        if: ${{ inputs.mode == 'ios' && inputs.sparse == 'true' }}
+        run: |
+          # GitHub rejects a single artifact file above 10 GB, and the root
+          # volume is now thirteen GB of payload. The sparse image still holds
+          # ten-odd GB of real bytes, so ship it gzipped and let the local
+          # side unpack it.
+          gzip -9 -c ios16-root.simg > ios16-root.simg.gz
+          rm -f ios16-root.simg
+          ls -l ios16-root.simg.gz
+
       - name: fingerprint
         run: |
-          shasum -a 256 *.raw *.simg 2>/dev/null | tee SHA256SUMS || true
+          shasum -a 256 *.raw *.simg *.simg.gz 2>/dev/null | tee SHA256SUMS || true
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -125,4 +136,5 @@ jobs:
           path: |
             *.raw
             *.simg
+            *.simg.gz
             SHA256SUMS
