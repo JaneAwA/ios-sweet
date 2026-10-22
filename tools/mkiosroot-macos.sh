@@ -120,8 +120,21 @@ copy() {
 	# off_t, and the shared cache files here are past 2 GB, so it dies with
 	# "Result too large (34)" partway through the system cryptex. bsdtar is
 	# 64 bit and carries the same set of attributes rsync was carrying for us
-	# (owner, mode, symlinks, hard links, xattrs).
-	(sudo tar -cf - -C "$1" .) | (sudo tar -xpf - -C "$2")
+	# (owner, mode, symlinks, hard links).
+	#
+	# --no-mac-metadata is REQUIRED here, not an optimisation. Apple ships the
+	# iOS system volume with the files stored decmpfs-compressed: the
+	# com.apple.decmpfs extended attribute holds the compressed payload and
+	# the BSD UF_COMPRESSED flag marks the inode. bsdtar stores those in the
+	# archive and restores them with setxattr(2) on extraction -- a path that
+	# does NOT go through copyfile(3), so COPYFILE_DISABLE=1 does not stop it
+	# (COPYFILE_DISABLE only gates the copyfile() metadata path). The result
+	# was a finished volume whose /sbin/launchd still carried the decmpfs
+	# xattr, which the SWEET/XNU port cannot decode (no AppleFSCompression
+	# kext, so decmpfs type 4 is "unregistered"), so execve() failed with
+	# EOPNOTSUPP (errno 45) and the kernel panicked.
+	sudo tar --no-mac-metadata --no-xattrs --no-acls --no-fflags -cf - -C "$1" . \
+		| sudo tar --no-mac-metadata --no-xattrs --no-acls --no-fflags -xpf - -C "$2"
 }
 copy "$osroot" "$mp"
 copy "$sysroot" "$mp/private/preboot/Cryptexes/OS"
@@ -269,6 +282,15 @@ echo "mounted final $omounted at $omp"
 # the CI runner, a silent exit-1 (chflags -R trips on system files -> set -e).
 
 # Streaming inflated copy: read through decmpfs (inflates) -> write uncompressed.
+# CRITICAL: --no-mac-metadata (and the individual --no-* flags) is what
+# actually keeps the decmpfs metadata off the final volume. COPYFILE_DISABLE=1
+# alone is NOT enough: bsdtar stores extended attributes in the archive
+# and restores them with setxattr(2), a path that never goes through
+# copyfile(3), so the com.apple.decmpfs xattr was still carried over and
+# the finished volume kept /sbin/launchd "compressed". XNU has no
+# AppleFSCompression kext (decmpfs type 4 is "unregistered"), so execve()
+# of that file failed with EOPNOTSUPP (errno 45) and the kernel panicked.
+echo "bulk-copying volume (inflating decmpfs, --no-mac-metadata) into final image..."
 # CRITICAL: COPYFILE_DISABLE=1 stops macOS tar (libarchive copyfile) from copying
 # the com.apple.decmpfs xattr AND the resource fork. Without it, tar carries the
 # decmpfs metadata onto the final volume; macOS then keeps the file "compressed"
@@ -282,89 +304,7 @@ set -e
 if [ "$rc" -ne 0 ]; then echo "ERROR: bulk copy tar failed (exit $rc)" >&2; exit 1; fi
 echo "bulk copy done"
 
-# NOTE: we intentionally do NOT run a per-file xattr -d / chflags pass on $omp.
-# bsdtar (tar -xpf) does NOT copy xattrs or BSD flags by default, so the fresh
-# inodes on the final volume carry NEITHER com.apple.decmpfs xattrs NOR the
-# nocompressed flag -- those residual-cleanup lines were pure no-ops that
-# forked a process per file across hundreds of thousands of files, looking
-# exactly like a hang. The final volume's compression is already OFF
-# (hfs.util -c off on $odev) and the payloads were inflated during the copy,
-# so nothing remains to strip. The authoritative Mach-O gate below confirms it.
 
-# Detach the scratch assembly volume.
-sudo umount "$mp"
-hdiutil detach "$dev" -force
-
-# Informational only: count the literal "com.apple.decmpfs" bytes in the
-# image. This INCLUDES stale B-tree bytes left behind when xattrs were deleted
-# and AppleDecmpfs.kext's own reference, so it must NOT be used as a hard gate
-# (a correctly stripped image can still show a high count from freed nodes).
-# NOTE: a failed grep used to be swallowed by `|| true` and silently reported
-# as 0, which looked like a clean image -- that is how a broken image shipped
-# with "DECMPFS_BYTES: 0". Report scan failures loudly instead.
-decmpfs_hits="$work/decmpfs.hits"
-grep -ao 'com.apple.decmpfs' "$out2" > "$decmpfs_hits" 2>/dev/null
-grep_rc=$?
-decmpfs_bytes=$(wc -l < "$decmpfs_hits" | tr -d ' ')
-if [ "$grep_rc" -gt 1 ]; then
-	echo "WARN: decmpfs scan FAILED (grep rc=$grep_rc) -- the count below is NOT verified" >&2
-fi
-echo "DECMPFS_BYTES: $decmpfs_bytes (informational; stale B-tree nodes may inflate this)"
-
-# Authoritative gate: the files we cannot boot without must be real,
-# uncompressed Mach-O images (or valid dyld caches). This runs WHILE the final
-# volume is still mounted, so it actually inspects the bytes -- a passed xattr
-# check is NOT enough, and flag/resource-fork compression survives xattr -d and
-# still trips EOPNOTSUPP(45) on /sbin/launchd. Verify the ACTUAL bytes.
-gate_fail=0
-# Real uncompressed proof: a file is safe for XNU ONLY IF it is a valid Mach-O
-# AND it carries NO com.apple.decmpfs xattr. macOS's decmpfs kext inflates on
-# read, so the Mach-O magic alone is a FALSE pass -- it would pass even for a
-# still-compressed file. We must also require the decmpfs xattr to be absent.
-check_macho() {
-	local p="$1" magic
-	[ -e "$p" ] || return 0
-	magic=$(sudo head -c 4 "$p" | xxd -p)
-	case "$magic" in
-		feedface|feedfacf|cffaedfe|cefaedfe|cafebabe|bebafeca) ;;
-		*) echo "ERROR: $p is not a valid Mach-O (magic=$magic)" >&2; return 1 ;;
-	esac
-	if sudo xattr -p com.apple.decmpfs "$p" >/dev/null 2>&1; then
-		echo "ERROR: $p still carries com.apple.decmpfs xattr (decmpfs NOT stripped; XNU will EOPNOTSUPP(45))" >&2
-		return 1
-	fi
-	# The kernel decides "compressed" from the UF_COMPRESSED BSD flag
-	# (decmpfs.c: decmpfs_file_is_compressed), so the flag itself must be gone
-	# too. macOS ls(1) prints it as "compressed".
-	if sudo ls -lO "$p" 2>/dev/null | grep -qw compressed; then
-		echo "ERROR: $p still has the UF_COMPRESSED BSD flag (XNU will EOPNOTSUPP(45))" >&2
-		return 1
-	fi
-	return 0
-}
-for probe in "$omp/sbin/launchd" "$omp/bin/launchd" "$omp/usr/libexec/launchd" "$omp/usr/lib/dyld"; do
-	[ -e "$probe" ] || continue
-	if ! check_macho "$probe"; then gate_fail=1; fi
-done
-dsc="$omp/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64"
-if [ ! -f "$dsc" ] && [ -f "$omp/private/preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64" ]; then
-	dsc="$omp/private/preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64"
-fi
-if [ -f "$dsc" ]; then
-	if ! head -c 11 "$dsc" | grep -q 'dyld_v1'; then
-		echo "ERROR: dyld shared cache is not inflated" >&2
-		gate_fail=1
-	fi
-	if sudo xattr -p com.apple.decmpfs "$dsc" >/dev/null 2>&1; then
-		echo "ERROR: dyld shared cache still carries com.apple.decmpfs xattr (decmpfs NOT stripped)" >&2
-		gate_fail=1
-	fi
-fi
-if [ "$gate_fail" -ne 0 ]; then
-	echo "decmpfs gate FAILED -- image is broken" >&2
-	exit 1
-fi
-echo "decmpfs gate passed"
 
 echo "--- volume header (offset 1024) ---"
 xxd -l 16 -s 1024 "$out2"
@@ -374,4 +314,41 @@ sudo umount "$omp"
 hdiutil detach "$odev" -force
 mv -f "$out2" "$out"
 echo "final image written to $out"
+
+# ---------------------------------------------------------------------------
+# AUTHORITATIVE decmpfs gate -- runs AFTER the volume has been unmounted and
+# detached, i.e. after every byte has actually been flushed to the backing
+# file.
+#
+# This scan used to run while the final volume was STILL MOUNTED and it
+# reported 0 on an image that shipped 1075 live "com.apple.decmpfs" records.
+# Mounted, the filesystem serves reads from its own cache and the backing file
+# on disk still held the pre-copy (mostly empty) content, so grep saw nothing;
+# only after umount did the real data -- including the decmpfs xattrs that
+# bsdtar had silently carried over -- land in the file. That false negative is
+# why a broken image was published as "DECMPFS_BYTES: 0" and why the device
+# panicked with errno 45 (EOPNOTSUPP) on execve("/sbin/launchd").
+#
+# The count is now a HARD gate: any occurrence of the xattr name in the
+# finished image means some file is still marked decmpfs-compressed, and XNU
+# (no AppleFSCompression kext -> decmpfs type 4 is "unregistered") cannot read
+# it. Refuse to publish the image instead of shipping another boot loop.
+decmpfs_hits="$work/decmpfs.hits"
+grep -ao 'com.apple.decmpfs' "$out" > "$decmpfs_hits" 2>/dev/null
+grep_rc=$?
+decmpfs_bytes=$(wc -l < "$decmpfs_hits" | tr -d ' ')
+if [ "$grep_rc" -gt 1 ]; then
+	echo "ERROR: decmpfs scan FAILED (grep rc=$grep_rc) -- cannot verify the image" >&2
+	exit 1
+fi
+echo "DECMPFS_BYTES: $decmpfs_bytes (post-unmount, authoritative)"
+if [ "$decmpfs_bytes" -ne 0 ]; then
+	echo "ERROR: the finished image still carries $decmpfs_bytes decmpfs records." >&2
+	echo "       Those files are still marked compressed; XNU cannot decode them" >&2
+	echo "       (decmpfs type 4 is unregistered) and execve() fails with errno 45." >&2
+	echo "       NOT publishing this image." >&2
+	sed -n '1,5p' "$decmpfs_hits" >&2
+	exit 1
+fi
+echo "decmpfs gate passed (image is clean)"
 ls -l "$out"
