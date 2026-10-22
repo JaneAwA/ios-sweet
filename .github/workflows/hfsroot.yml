@@ -39,7 +39,11 @@ concurrency:
 
 jobs:
   hfsroot:
-    runs-on: macos-14
+    # macos-14's arm64 pool is chronically saturated; jobs there fail with
+    # "The job was not acquired by Runner of type hosted" over and over.
+    # macos-15 is the same tooling (newfs_hfs, hdiutil, bsdtar) with a
+    # healthier queue.
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
