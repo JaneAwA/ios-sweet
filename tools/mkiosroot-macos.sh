@@ -200,22 +200,35 @@ done
 strip_decmpfs() {
 	set +e
 	echo "stripping decmpfs compression (XNU has no decmpfs)..."
+
+	# Best-effort: turn OFF HFS+ transparent volume compression so the
+	# rewrite below is never silently re-compressed by the kernel on write.
+	# If this tool is unavailable the authoritative gate still catches leftovers.
+	sudo /usr/sbin/hfs.util -c off "$dev" 2>/dev/null || true
+
 	# iOS system files are extracted with the system-immutable (schg) and/or
-	# user-immutable (uchg) flag set, which blocks xattr removal below. Clear
-	# every immutable flag on the volume first.
+	# user-immutable (uchg) flag set, which blocks attribute/file changes.
+	# Clear every immutable flag on the volume first.
 	sudo chflags -R noschg,nouchg,nosappnd,nouappnd,nosunlnk,nouunlnk "$mp" 2>/dev/null
-	# Unconditionally drop the decmpfs xattr from EVERY regular file. Files
-	# without it simply error (ignored); files with it lose the marker so the
-	# kernel no longer attempts decompression via the (absent) decmpfs kext and
-	# returns the data fork as-is. We do NOT gate on enumeration first: every
-	# prior enumeration method (xattr -r -l, find -xattrname, find | xattr -p)
-	# silently matched nothing on this CI runner and let broken images through
-	# (the v5/v6/v8 runs all reported "0 files detected" while the device still
-	# panicked with errno 45). Brute force cannot miss a file.
+
+	# Force every regular file's data fork to be rewritten from its own
+	# (kext-inflated) read through a fresh inode. This drops the compressed
+	# flag and any resource-fork / flag-form decmpfs that `xattr -d` misses --
+	# that form is exactly what left /sbin/launchd compressed and panicked the
+	# device with errno 45 (EOPNOTSUPP). The new inode carries no compressed
+	# flag, so the kernel no longer attempts decompression.
+	sudo find "$mp" -type f -print0 2>/dev/null | while IFS= read -r -d '' f; do
+		sudo sh -c 'cat "$1" > "$1.__dcmp" && mv -f "$1.__dcmp" "$1"' _ "$f" 2>/dev/null
+	done
+
+	# Drop the decmpfs xattr from EVERY regular file (xattr-form compression).
 	sudo find "$mp" -type f -print0 2>/dev/null \
 		| sudo xargs -0 -P8 xattr -d com.apple.decmpfs 2>/dev/null
-	# Defensive second pass over any path the first xargs left behind.
 	sudo find "$mp" -type f -exec sudo xattr -d com.apple.decmpfs {} \; 2>/dev/null
+
+	# Clear the BSD compressed flag on every file (flag-form compression).
+	sudo chflags -R nocompressed "$mp" 2>/dev/null
+
 	echo "decmpfs strip complete"
 	set -e
 }
@@ -254,21 +267,33 @@ hdiutil detach "$dev" -force
 decmpfs_bytes=$(grep -ao 'com.apple.decmpfs' "$out" 2>/dev/null | wc -l | tr -d ' ') || true
 echo "DECMPFS_BYTES: $decmpfs_bytes (informational; stale B-tree nodes may inflate this)"
 
-# Authoritative gate: probe KNOWN decmpfs-compressed files directly. /sbin/
-# launchd is the file that panicked on the device with errno 45; if it still
-# carries the com.apple.decmpfs xattr after the unconditional strip above, the
-# kernel would again try (and fail) to decompress it. This is a per-file check
-# on a handful of paths, not a whole-volume enumeration, so it cannot be thrown
-# off by stale bytes or by the runner's unreliable recursive xattr enumeration.
+# Authoritative gate: the files we cannot boot without must be real,
+# uncompressed Mach-O images (or valid dyld caches). A passed xattr check
+# is NOT enough -- flag/resource-fork compression survives xattr -d and
+# still trips EOPNOTSUPP(45) on /sbin/launchd. Verify the actual bytes.
 gate_fail=0
-for probe in "$mp/sbin/launchd" "$mp/bin/launchd" "$mp/usr/libexec/launchd" \
-             "$mp/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64"; do
+check_macho() {
+	local p="$1" magic
+	[ -e "$p" ] || return 0
+	magic=$(sudo head -c 4 "$p" | xxd -p)
+	case "$magic" in
+		feedface|feedfacf|cffaedfe|cefaedfe|cafebabe|bebafeca) return 0 ;;
+		*) echo "ERROR: $p is not a valid Mach-O (magic=$magic)" >&2; return 1 ;;
+	esac
+}
+for probe in "$mp/sbin/launchd" "$mp/bin/launchd" "$mp/usr/libexec/launchd"; do
 	[ -e "$probe" ] || continue
+	if ! check_macho "$probe"; then gate_fail=1; fi
 	if sudo xattr -p com.apple.decmpfs "$probe" >/dev/null 2>&1; then
-		echo "ERROR: $probe still has com.apple.decmpfs xattr after strip" >&2
+		echo "ERROR: $probe still has com.apple.decmpfs xattr" >&2
 		gate_fail=1
 	fi
 done
+dsc="$mp/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64"
+if [ -f "$dsc" ] && ! head -c 11 "$dsc" | grep -q 'dyld_v1'; then
+	echo "ERROR: dyld shared cache is not inflated" >&2
+	gate_fail=1
+fi
 if [ "$gate_fail" -ne 0 ]; then
 	echo "decmpfs gate FAILED -- image is broken" >&2
 	exit 1
