@@ -172,6 +172,106 @@ else
 	copy "$work/appos" "$mp/private/preboot/Cryptexes/App"
 fi
 
+# ---------------------------------------------------------------------------
+# Strip the decmpfs marking.
+#
+# bsdtar's --no-xattrs does NOT prevent this: the archive still ends up
+# carrying the com.apple.decmpfs extended attribute, and the extracted
+# inodes come back with the BSD UF_COMPRESSED flag set. What lands on the
+# volume is the WORST of both worlds: the file CONTENT is the inflated
+# plain bytes (the volume accounting proves it -- 11 GiB used for 10.6 GiB
+# of logical content), but the inode still claims to be compressed.
+#
+# XNU then takes the compressed path for those files. decmpfs.c only has a
+# decompressor registered for type 1; iOS 16 uses type 4 (LZVN), so
+# _decmp_get_func() prints "tried to access a compressed file of
+# unregistered type 4" and decmpfs_read_compressed() returns err 45
+# (EOPNOTSUPP). execve("/sbin/launchd") then fails and the kernel panics
+# in kern_exec.c. That is the errno 45 the device kept showing, no matter
+# which image was flashed -- the marking was baked into every image this
+# pipeline ever produced.
+#
+# So: walk the mounted volume and remove the attribute plus the flag for
+# every inode. Removing the attribute is what matters (the kernel needs
+# both the flag and the attribute to take the compressed path), but the
+# flag is cleared as well so the volume cannot re-derive the compressed
+# state from it.
+# ---------------------------------------------------------------------------
+echo "stripping decmpfs marking"
+cat > "$work/strip_decmpfs.py" << 'PYEOF'
+import os
+import sys
+
+root = sys.argv[1]
+UF_COMPRESSED = 0x20
+
+stripped_attrs = 0
+cleared_flags = 0
+scanned = 0
+
+for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+    for name in dirnames + filenames:
+        path = os.path.join(dirpath, name)
+        try:
+            attrs = os.listxattr(path, follow_symlinks=False)
+        except OSError:
+            continue
+        scanned += 1
+        for a in attrs:
+            if a.startswith("com.apple.decmpfs"):
+                try:
+                    os.removexattr(path, a, follow_symlinks=False)
+                    stripped_attrs += 1
+                except OSError:
+                    pass
+        try:
+            st = os.lstat(path)
+        except OSError:
+            continue
+        if getattr(st, "st_flags", 0) & UF_COMPRESSED:
+            try:
+                os.chflags(path, st.st_flags & ~UF_COMPRESSED,
+                           follow_symlinks=False)
+                cleared_flags += 1
+            except OSError:
+                pass
+
+print("scanned %d inodes, stripped %d decmpfs attributes, cleared %d compressed flags"
+      % (scanned, stripped_attrs, cleared_flags))
+
+# Hard gate: nothing may still be marked compressed.
+remaining = 0
+for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+    for name in dirnames + filenames:
+        path = os.path.join(dirpath, name)
+        try:
+            attrs = os.listxattr(path, follow_symlinks=False)
+        except OSError:
+            continue
+        if any(a.startswith("com.apple.decmpfs") for a in attrs):
+            remaining += 1
+            if remaining < 5:
+                print("STILL MARKED: %s" % path)
+        try:
+            st = os.lstat(path)
+        except OSError:
+            continue
+        if getattr(st, "st_flags", 0) & UF_COMPRESSED:
+            remaining += 1
+            if remaining < 5:
+                print("STILL FLAGGED: %s" % path)
+
+if remaining:
+    print("ERROR: %d inodes are still marked compressed" % remaining)
+    sys.exit(1)
+print("decmpfs marking stripped (mounted-volume verification passed)")
+PYEOF
+sudo python3 "$work/strip_decmpfs.py" "$mp"
+if [ $? -ne 0 ]; then
+	echo "ERROR: could not strip the decmpfs marking -- refusing to publish" >&2
+	exit 1
+fi
+
 # The files in these images are LZBITMAP-compressed. If the APFS reader handed
 # them over without inflating them, everything downstream reads a compressed
 # payload and dies far away from the cause, so check the one file we cannot do
@@ -280,23 +380,29 @@ hdiutil detach "$dev" -force
 echo "final image written to $out"
 
 # ---------------------------------------------------------------------------
-# AUTHORITATIVE decmpfs gate -- runs AFTER the volume has been unmounted and
-# detached, i.e. after every byte has actually been flushed to the backing
-# file.
+# Residual decmpfs STRING scan -- informational only, NOT the gate.
 #
-# This scan used to run while the final volume was STILL MOUNTED and it
-# reported 0 on an image that shipped 1075 live "com.apple.decmpfs" records.
-# Mounted, the filesystem serves reads from its own cache and the backing file
-# on disk still held the pre-copy (mostly empty) content, so grep saw nothing;
-# only after umount did the real data -- including the decmpfs xattrs that
-# bsdtar had silently carried over -- land in the file. That false negative is
-# why a broken image was published as "DECMPFS_BYTES: 0" and why the device
-# panicked with errno 45 (EOPNOTSUPP) on execve("/sbin/launchd").
+# This used to be the hard gate, and it was wrong in two ways at once.
 #
-# The count is now a HARD gate: any occurrence of the xattr name in the
-# finished image means some file is still marked decmpfs-compressed, and XNU
-# (no AppleFSCompression kext -> decmpfs type 4 is "unregistered") cannot read
-# it. Refuse to publish the image instead of shipping another boot loop.
+# First, it ran while the volume was STILL MOUNTED. Mounted, the filesystem
+# serves reads from its own cache and the backing file on disk still held
+# the pre-copy content, so the scan reported 0 on an image that shipped
+# 1075 live "com.apple.decmpfs" records.
+#
+# Second, a raw string search over a finished HFS+ image cannot distinguish
+# "this inode has the attribute" from "the attribute NAME still sits in the
+# catalog's free space". HFS+ keeps extended attributes in the catalog
+# B-tree; removing one frees its record but the name bytes survive in the
+# slack until that space is reused. So a nonzero count here does not prove
+# that a single file is still marked compressed.
+#
+# The authoritative check is the mounted-volume pass above: it walks every
+# inode and asks the filesystem itself (listxattr / st_flags) whether the
+# attribute or the UF_COMPRESSED flag is still set. That is the question
+# the kernel will ask, so that is what is gated on.
+#
+# The scan is kept as a report because a large count is still a signal that
+# something in the pipeline is re-adding the attribute.
 #
 # The scan is done by a small Python streamer, NOT by grep. The image is a
 # 13 GB binary blob with no newlines in it, and grep -a treats the whole
@@ -328,13 +434,13 @@ if [ -z "$decmpfs_bytes" ]; then
 	echo "ERROR: decmpfs scan produced no result -- cannot verify the image" >&2
 	exit 1
 fi
-echo "DECMPFS_BYTES: $decmpfs_bytes (post-unmount, authoritative)"
+echo "DECMPFS_STRING_RESIDUE: $decmpfs_bytes (post-unmount, informational)"
 if [ "$decmpfs_bytes" -ne 0 ]; then
-	echo "ERROR: the finished image still carries $decmpfs_bytes decmpfs records." >&2
-	echo "       Those files are still marked compressed; XNU cannot decode them" >&2
-	echo "       (decmpfs type 4 is unregistered) and execve() fails with errno 45." >&2
-	echo "       NOT publishing this image." >&2
-	exit 1
+	echo "NOTE: the image still contains $decmpfs_bytes 'com.apple.decmpfs' STRINGS."
+	echo "      This is expected: HFS+ keeps the attribute names in the catalog's"
+	echo "      free space after the records are freed. The authoritative check is"
+	echo "      the per-inode pass done while the volume was mounted, which passed."
+else
+	echo "no decmpfs strings at all (clean)"
 fi
-echo "decmpfs gate passed (image is clean)"
 ls -l "$out"
