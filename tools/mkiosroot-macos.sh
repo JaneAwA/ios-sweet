@@ -299,7 +299,16 @@ hdiutil detach "$dev" -force
 # image. This INCLUDES stale B-tree bytes left behind when xattrs were deleted
 # and AppleDecmpfs.kext's own reference, so it must NOT be used as a hard gate
 # (a correctly stripped image can still show a high count from freed nodes).
-decmpfs_bytes=$(grep -ao 'com.apple.decmpfs' "$out2" 2>/dev/null | wc -l | tr -d ' ') || true
+# NOTE: a failed grep used to be swallowed by `|| true` and silently reported
+# as 0, which looked like a clean image -- that is how a broken image shipped
+# with "DECMPFS_BYTES: 0". Report scan failures loudly instead.
+decmpfs_hits="$tmp/decmpfs.hits"
+grep -ao 'com.apple.decmpfs' "$out2" > "$decmpfs_hits" 2>/dev/null
+grep_rc=$?
+decmpfs_bytes=$(wc -l < "$decmpfs_hits" | tr -d ' ')
+if [ "$grep_rc" -gt 1 ]; then
+	echo "WARN: decmpfs scan FAILED (grep rc=$grep_rc) -- the count below is NOT verified" >&2
+fi
 echo "DECMPFS_BYTES: $decmpfs_bytes (informational; stale B-tree nodes may inflate this)"
 
 # Authoritative gate: the files we cannot boot without must be real,
@@ -324,9 +333,16 @@ check_macho() {
 		echo "ERROR: $p still carries com.apple.decmpfs xattr (decmpfs NOT stripped; XNU will EOPNOTSUPP(45))" >&2
 		return 1
 	fi
+	# The kernel decides "compressed" from the UF_COMPRESSED BSD flag
+	# (decmpfs.c: decmpfs_file_is_compressed), so the flag itself must be gone
+	# too. macOS ls(1) prints it as "compressed".
+	if sudo ls -lO "$p" 2>/dev/null | grep -qw compressed; then
+		echo "ERROR: $p still has the UF_COMPRESSED BSD flag (XNU will EOPNOTSUPP(45))" >&2
+		return 1
+	fi
 	return 0
 }
-for probe in "$omp/sbin/launchd" "$omp/bin/launchd" "$omp/usr/libexec/launchd"; do
+for probe in "$omp/sbin/launchd" "$omp/bin/launchd" "$omp/usr/libexec/launchd" "$omp/usr/lib/dyld"; do
 	[ -e "$probe" ] || continue
 	if ! check_macho "$probe"; then gate_fail=1; fi
 done
