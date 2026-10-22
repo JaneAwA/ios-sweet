@@ -216,8 +216,18 @@ libc.listxattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p,
 libc.listxattr.restype = ctypes.c_ssize_t
 libc.removexattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
 libc.removexattr.restype = ctypes.c_int
+libc.setxattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p,
+                           ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+libc.setxattr.restype = ctypes.c_int
 
 XATTR_NOFOLLOW = 0x0001
+
+
+def set_xattr(path, name, value):
+    enc = os.fsencode(path)
+    buf = ctypes.create_string_buffer(value, len(value))
+    return libc.setxattr(enc, name.encode("utf-8"), buf, len(value),
+                         XATTR_NOFOLLOW) == 0
 
 
 def list_xattrs(path):
@@ -247,22 +257,34 @@ root = sys.argv[1]
 UF_COMPRESSED = 0x20
 
 # --- self-test -------------------------------------------------------------
-# If the libc plumbing were broken, the whole scan would silently report
-# "nothing to strip" and the image would ship broken. Prove the machinery
-# works on one known file before trusting its verdict over the whole tree.
-probe = os.path.join(root, "bin", "ls")
-if os.path.exists(probe):
-    st = os.lstat(probe)
-    print("PROBE %s attrs=%r flags=0x%x" %
-          (probe, list_xattrs(probe), getattr(st, "st_flags", 0)))
-    try:
-        out = subprocess.run(["xattr", "-l", probe], capture_output=True,
-                             text=True, timeout=30).stdout.strip()
-        print("PROBE xattr(1) says: %r" % out)
-    except Exception as exc:
-        print("PROBE xattr(1) failed: %s" % exc)
-else:
-    print("PROBE: %s does not exist" % probe)
+# The whole verdict rests on listxattr() actually working. If it does not
+# (wrong libc, wrong flags, a permission problem), every inode reports "no
+# attributes" and the scan silently passes an image that is still broken --
+# which is exactly the false negative that shipped a broken volume before.
+#
+# So: create a file, set a known attribute on it, read it back, and delete
+# it again. If the round trip fails, the scan cannot be trusted and the
+# build must stop.
+probe_dir = os.path.join(root, ".decmpfs-probe")
+probe = os.path.join(probe_dir, "probe")
+os.makedirs(probe_dir, exist_ok=True)
+with open(probe, "wb") as fh:
+    fh.write(b"probe")
+set_xattr(probe, "com.apple.decmpfs", b"\x00" * 16)
+back = list_xattrs(probe)
+print("PROBE setxattr/listxattr round trip: %r" % (back,))
+probe_ok = any(a == "com.apple.decmpfs" for a in back)
+if not probe_ok:
+    print("ERROR: the xattr probe did not read back -- listxattr is not")
+    print("       trustworthy here, so the decmpfs verdict below is meaningless.")
+    sys.exit(2)
+print("PROBE xattr(1) says: %r" %
+      subprocess.run(["xattr", "-l", probe], capture_output=True,
+                     text=True, timeout=30).stdout.strip())
+remove_xattr(probe, "com.apple.decmpfs")
+print("PROBE after removal: %r" % (list_xattrs(probe),))
+os.unlink(probe)
+os.rmdir(probe_dir)
 
 # --- strip -----------------------------------------------------------------
 stripped_attrs = 0
@@ -331,6 +353,56 @@ PYEOF
 sudo python3 "$work/strip_decmpfs.py" "$mp"
 if [ $? -ne 0 ]; then
 	echo "ERROR: could not strip the decmpfs marking -- refusing to publish" >&2
+	exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Gate the files the kernel cannot boot without.
+#
+# The whole-volume pass above says "nothing is marked compressed". This says
+# "the files that matter are actually usable", which is the question the
+# kernel asks. Three conditions per file:
+#
+#   1. it is a valid Mach-O (or a dyld cache),
+#   2. it carries no com.apple.decmpfs xattr,
+#   3. it has no UF_COMPRESSED BSD flag.
+#
+# (1) alone is NOT enough: macOS's own decmpfs support inflates on read, so
+# a still-compressed file also looks like a valid Mach-O. That is a false
+# pass, and it is how the "the magic is right, so it must be fine" mistake
+# happens. (3) matters because the kernel decides "compressed" from the
+# UF_COMPRESSED flag, and that flag survives an xattr removal.
+# ---------------------------------------------------------------------------
+check_macho() {
+	local p="$1" magic
+	[ -e "$p" ] || return 0
+	magic=$(sudo head -c 4 "$p" | xxd -p)
+	case "$magic" in
+		feedface|feedfacf|cffaedfe|cefaedfe|cafebabe|bebafeca) ;;
+		*) echo "ERROR: $p is not a valid Mach-O (magic=$magic)" >&2; return 1 ;;
+	esac
+	if sudo xattr -p com.apple.decmpfs "$p" >/dev/null 2>&1; then
+		echo "ERROR: $p still carries the com.apple.decmpfs xattr" >&2
+		echo "       (XNU has no LZVN decompressor -> execve() returns 45)" >&2
+		return 1
+	fi
+	if sudo ls -lO "$p" 2>/dev/null | grep -qw compressed; then
+		echo "ERROR: $p still has the UF_COMPRESSED BSD flag" >&2
+		echo "       (the kernel takes the compressed read path -> errno 45)" >&2
+		return 1
+	fi
+	echo "  ok: $p"
+	return 0
+}
+gate_fail=0
+for probe in "$mp/sbin/launchd" "$mp/bin/launchd" "$mp/usr/libexec/launchd" \
+             "$mp/usr/lib/dyld" "$mp/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64" \
+             "$mp/private/preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64"; do
+	[ -e "$probe" ] || continue
+	check_macho "$probe" || gate_fail=1
+done
+if [ "$gate_fail" -ne 0 ]; then
+	echo "ERROR: a file the kernel needs is unusable -- refusing to publish" >&2
 	exit 1
 fi
 
